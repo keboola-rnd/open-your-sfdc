@@ -1,0 +1,113 @@
+{% extends "base.html" %}
+{% block title %}Migrate — Salesforce objects{% endblock %}
+
+{% block content %}
+<div class="mb-4">
+    <div class="text-xs text-slate-500">
+        <a href="{{ url_for('sf.dashboard') }}" class="hover:underline">Objects</a> / Migrate
+    </div>
+    <h1 class="text-2xl font-bold">Migration reports</h1>
+    <p class="text-sm text-slate-600 mt-1 max-w-3xl">
+        Pick an object to see per-field fill rates, dead fields, and generate a
+        CREATE TABLE statement for your target database. Useful when planning
+        your move off Salesforce — strip unused custom fields, confirm data types,
+        export only what you actually need.
+    </p>
+</div>
+
+<div class="bg-white rounded-lg shadow p-3 mb-4 flex flex-wrap items-center gap-3">
+    <label class="text-xs text-slate-500">Filter:</label>
+    <input id="migrate-filter" type="search" placeholder="Search by name or label..."
+           class="border rounded px-2 py-1 text-sm w-72 focus:outline-none focus:ring-2 focus:ring-blue-400">
+    <label class="inline-flex items-center gap-1.5 text-xs text-slate-600 cursor-pointer">
+        <input id="migrate-nonempty" type="checkbox" checked
+               class="w-3.5 h-3.5 rounded border-slate-300">
+        <span>only objects with records</span>
+    </label>
+    <label class="inline-flex items-center gap-1.5 text-xs text-slate-600 cursor-pointer">
+        <input id="migrate-custom" type="checkbox"
+               class="w-3.5 h-3.5 rounded border-slate-300">
+        <span>only custom (__c)</span>
+    </label>
+    <span id="migrate-count" class="text-xs text-slate-500 ml-auto"></span>
+</div>
+
+<div class="bg-white rounded-lg shadow overflow-auto">
+    <table class="min-w-full text-sm" id="migrate-table">
+        <thead class="bg-slate-100 text-left text-xs text-slate-600 uppercase tracking-wide">
+            <tr>
+                <th class="px-3 py-2">API name</th>
+                <th class="px-3 py-2">Label</th>
+                <th class="px-3 py-2 text-right">Records</th>
+                <th class="px-3 py-2 text-right">Fields</th>
+                <th class="px-3 py-2">Type</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for o in objects %}
+            <tr class="border-t border-slate-100 hover:bg-slate-50 migrate-row"
+                data-name="{{ o.name|lower }}"
+                data-label="{{ o.label|lower }}"
+                data-records="{{ o.record_count }}"
+                data-custom="{{ '1' if o.custom else '0' }}">
+                <td class="px-3 py-1.5 font-mono">
+                    <a href="{{ url_for('sf.migrate_object', object_name=o.name) }}"
+                       class="text-blue-700 hover:underline">{{ o.name }}</a>
+                </td>
+                <td class="px-3 py-1.5">{{ o.label }}</td>
+                <td class="px-3 py-1.5 text-right tabular-nums">
+                    {{ "{:,}".format(o.record_count) }}
+                </td>
+                <td class="px-3 py-1.5 text-right tabular-nums text-slate-600">
+                    {{ o.field_count }}
+                </td>
+                <td class="px-3 py-1.5">
+                    {% if o.custom %}
+                        <span class="text-[10px] bg-amber-100 text-amber-800 rounded px-1.5 py-0.5">custom</span>
+                    {% else %}
+                        <span class="text-[10px] bg-slate-100 text-slate-600 rounded px-1.5 py-0.5">standard</span>
+                    {% endif %}
+                </td>
+            </tr>
+            {% else %}
+            <tr><td colspan="5" class="text-center text-slate-500 py-6">No objects.</td></tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
+
+<script>
+(function() {
+    const filter = document.getElementById('migrate-filter');
+    const onlyNonEmpty = document.getElementById('migrate-nonempty');
+    const onlyCustom = document.getElementById('migrate-custom');
+    const countEl = document.getElementById('migrate-count');
+    const rows = Array.from(document.querySelectorAll('.migrate-row'));
+
+    function apply() {
+        const q = (filter.value || '').toLowerCase().trim();
+        const ne = onlyNonEmpty.checked;
+        const cu = onlyCustom.checked;
+        let visible = 0;
+        rows.forEach(r => {
+            const name = r.dataset.name;
+            const label = r.dataset.label;
+            const records = parseInt(r.dataset.records, 10) || 0;
+            const custom = r.dataset.custom === '1';
+            let show = true;
+            if (q && !(name.includes(q) || label.includes(q))) show = false;
+            if (ne && records === 0) show = false;
+            if (cu && !custom) show = false;
+            r.style.display = show ? '' : 'none';
+            if (show) visible += 1;
+        });
+        countEl.textContent = visible + ' of ' + rows.length + ' objects shown';
+    }
+
+    filter.addEventListener('input', apply);
+    onlyNonEmpty.addEventListener('change', apply);
+    onlyCustom.addEventListener('change', apply);
+    apply();
+})();
+</script>
+{% endblock %}

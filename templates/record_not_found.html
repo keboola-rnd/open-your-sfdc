@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+{% block title %}Record not found{% endblock %}
+
+{% block content %}
+<div class="max-w-2xl mx-auto mt-12">
+    <div class="bg-white rounded-lg shadow p-8 text-center">
+        <div class="text-6xl text-slate-300 mb-4">404</div>
+        <h1 class="text-xl font-bold mb-2">Record not found in export</h1>
+        <div class="text-slate-500 mb-6">
+            <p class="mb-2">
+                The record <code class="bg-slate-100 px-2 py-0.5 rounded">{{ record_id }}</code>
+                was not found in the <strong>{{ obj.label }}</strong> table.
+            </p>
+            <p class="text-sm">
+                This usually means the record was deleted in Salesforce before the export,
+                or it belongs to a different object type.
+            </p>
+        </div>
+        <div class="flex justify-center gap-3">
+            <a href="{{ url_for('sf.table_view', object_name=obj.name) }}"
+               class="bg-blue-600 hover:bg-blue-700 text-white rounded px-4 py-2 text-sm transition-colors">
+                Browse {{ obj.label }}
+            </a>
+            <a href="{{ url_for('sf.search_view', q=record_id) }}"
+               class="bg-slate-100 hover:bg-slate-200 rounded px-4 py-2 text-sm transition-colors">
+                Search for this ID
+            </a>
+            <a href="{{ url_for('sf.dashboard') }}"
+               class="bg-slate-100 hover:bg-slate-200 rounded px-4 py-2 text-sm transition-colors">
+                Dashboard
+            </a>
+        </div>
+    </div>
+</div>
+{% endblock %}

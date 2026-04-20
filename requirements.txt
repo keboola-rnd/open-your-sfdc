@@ -1,0 +1,9 @@
+# Web browser
+flask>=3.0
+markupsafe>=2.1
+
+# Salesforce API + bulk
+simple-salesforce>=1.12
+
+# HTTP for downloading binaries (Attachments / ContentVersion bodies)
+requests>=2.31

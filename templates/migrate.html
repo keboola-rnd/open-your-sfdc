@@ -1,0 +1,283 @@
+{% extends "base.html" %}
+{% block title %}Migrate {{ obj.name }}{% endblock %}
+
+{% block content %}
+<div class="mb-4">
+    <div class="text-xs text-slate-500">
+        <a href="{{ url_for('sf.dashboard') }}" class="hover:underline">Objects</a> /
+        <a href="{{ url_for('sf.migrate_index') }}" class="hover:underline">Migrate</a> /
+        <span>{{ obj.label or obj.name }}</span>
+    </div>
+    <div class="flex items-center justify-between mt-1">
+        <div>
+            <h1 class="text-2xl font-bold font-mono">{{ obj.name }}</h1>
+            <div class="text-sm text-slate-500">
+                {{ obj.label }}
+                &middot; {{ "{:,}".format(obj.record_count or 0) }} records
+                &middot; {{ total_fields }} fields
+                {% if obj.custom %}
+                <span class="text-[10px] text-amber-600 ml-1 align-middle">custom</span>
+                {% endif %}
+            </div>
+        </div>
+        <div class="flex items-center gap-2">
+            <a class="text-sm bg-slate-100 hover:bg-slate-200 rounded px-3 py-1.5"
+               href="{{ url_for('sf.table_view', object_name=obj.name) }}">→ Table view</a>
+            <a class="text-sm bg-slate-100 hover:bg-slate-200 rounded px-3 py-1.5"
+               href="{{ url_for('sf.schema_view', object_name=obj.name) }}">→ Schema</a>
+            <label class="inline-flex items-center gap-1.5 ml-3 text-xs text-slate-600 cursor-pointer">
+                <input id="show-populated" type="checkbox"
+                       class="w-3.5 h-3.5 rounded border-slate-300">
+                <span>show only populated</span>
+            </label>
+        </div>
+    </div>
+</div>
+
+{# ── Summary stats ── #}
+<section class="bg-white rounded-lg shadow-sm border border-slate-200 p-4 mb-4 flex flex-wrap gap-6">
+    <div>
+        <div class="text-[10px] uppercase tracking-wide text-slate-500">Fields</div>
+        <div class="text-xl font-bold">{{ total_fields }}</div>
+    </div>
+    <div>
+        <div class="text-[10px] uppercase tracking-wide text-slate-500">Populated</div>
+        <div class="text-xl font-bold text-emerald-700">{{ populated_fields }}</div>
+    </div>
+    <div>
+        <div class="text-[10px] uppercase tracking-wide text-slate-500">Dead (fill 0%)</div>
+        <div class="text-xl font-bold text-red-600">{{ dead_fields|length }}</div>
+    </div>
+    <div>
+        <div class="text-[10px] uppercase tracking-wide text-slate-500">Custom</div>
+        <div class="text-xl font-bold text-amber-700">{{ custom_fields }}</div>
+    </div>
+    <div>
+        <div class="text-[10px] uppercase tracking-wide text-slate-500">Avg fill rate</div>
+        <div class="text-xl font-bold">{{ "{:.0%}".format(avg_fill) }}</div>
+    </div>
+</section>
+
+{# ── Dead fields panel ── #}
+{% if dead_fields %}
+<details class="bg-red-50 border border-red-200 rounded-lg p-3 mb-4">
+    <summary class="text-sm font-semibold text-red-900 cursor-pointer flex items-center gap-2">
+        <span class="chevron text-red-500">▸</span>
+        Dead fields
+        <span class="text-xs text-red-700 font-normal">({{ dead_fields|length }} never populated)</span>
+    </summary>
+    <p class="text-xs text-red-800 mt-2 mb-2">
+        These fields have no value in any record in this export. Safe to drop
+        from the migration unless your target system needs them defined.
+    </p>
+    <div class="flex flex-wrap gap-1.5">
+        {% for f in dead_fields %}
+        <span class="inline-flex items-center bg-white border border-red-300 rounded px-2 py-0.5 text-xs font-mono text-red-800"
+              title="{{ f.label }}">
+            {{ f.field_name }}
+        </span>
+        {% endfor %}
+    </div>
+</details>
+{% endif %}
+
+{# ── Field table inside a form ── #}
+<form id="migrate-form" method="post"
+      action="{{ url_for('sf.migrate_export_csv', object_name=obj.name) }}"
+      class="bg-white rounded-lg shadow overflow-auto">
+    <div class="flex flex-wrap items-center gap-2 px-3 py-2 border-b border-slate-200 text-xs bg-slate-50 sticky top-0 z-10">
+        <button type="button" id="sel-all" class="bg-slate-100 hover:bg-slate-200 rounded px-2 py-1">Select all</button>
+        <button type="button" id="sel-none" class="bg-slate-100 hover:bg-slate-200 rounded px-2 py-1">Select none</button>
+        <button type="button" id="sel-populated" class="bg-slate-100 hover:bg-slate-200 rounded px-2 py-1">Select populated</button>
+        <span class="text-slate-500 ml-3" id="sel-count"></span>
+        <div class="ml-auto flex items-center gap-2">
+            <button type="button" id="show-ddl" class="bg-slate-700 hover:bg-slate-800 text-white rounded px-3 py-1.5">Show DDL</button>
+            <button type="submit" class="bg-emerald-600 hover:bg-emerald-700 text-white rounded px-3 py-1.5">Export CSV</button>
+        </div>
+    </div>
+    <table class="min-w-full text-sm" id="stats-table">
+        <thead class="bg-slate-100 text-left text-xs uppercase tracking-wide text-slate-600">
+            <tr>
+                <th class="px-2 py-2 w-8"></th>
+                <th class="px-2 py-2">Field</th>
+                <th class="px-2 py-2">SF type</th>
+                <th class="px-2 py-2 w-60">Fill</th>
+                <th class="px-2 py-2 text-right">Distinct</th>
+                <th class="px-2 py-2">Top values</th>
+                <th class="px-2 py-2 font-mono">Target DDL</th>
+            </tr>
+        </thead>
+        <tbody>
+        {% for s in stats %}
+            {% set is_empty = (s.fill_rate or 0) == 0 %}
+            <tr class="border-t border-slate-100 stats-row {% if is_empty %}row-empty{% endif %}">
+                <td class="px-2 py-1.5 align-top">
+                    <input type="checkbox" id="sel_{{ s.field_name }}" name="fields" value="{{ s.field_name }}"
+                           class="field-check w-3.5 h-3.5 rounded border-slate-300"
+                           {% if not is_empty %}checked{% endif %}>
+                </td>
+                <td class="px-2 py-1.5 align-top">
+                    <div class="flex items-center gap-2">
+                        <span class="font-medium">{{ s.label }}</span>
+                        {% if s.custom %}
+                        <span class="text-[9px] bg-amber-100 text-amber-800 rounded px-1 py-0.5">custom</span>
+                        {% endif %}
+                        {% if not s.nillable %}
+                        <span class="text-[9px] bg-slate-200 text-slate-700 rounded px-1 py-0.5">required</span>
+                        {% endif %}
+                    </div>
+                    <div class="text-[11px] font-mono text-slate-500">{{ s.field_name }}</div>
+                </td>
+                <td class="px-2 py-1.5 align-top">
+                    <span class="text-[11px] bg-slate-100 text-slate-700 rounded px-1.5 py-0.5 font-mono">
+                        {{ s.sf_type or '?' }}
+                    </span>
+                </td>
+                <td class="px-2 py-1.5 align-top">
+                    <div class="flex items-center gap-2">
+                        <div class="flex-1 h-2 rounded bg-slate-100 overflow-hidden min-w-[100px]">
+                            <div class="h-full {% if is_empty %}bg-red-300{% else %}bg-emerald-500{% endif %}"
+                                 style="width: {{ (s.fill_rate * 100)|round(1) }}%"></div>
+                        </div>
+                        <span class="text-xs tabular-nums text-slate-600 w-14 text-right">
+                            {{ "{:.1f}%".format((s.fill_rate or 0) * 100) }}
+                        </span>
+                    </div>
+                    <div class="text-[10px] text-slate-400 mt-0.5">
+                        {{ "{:,}".format(s.fill_count) }} / {{ "{:,}".format(obj.record_count or 0) }}
+                    </div>
+                </td>
+                <td class="px-2 py-1.5 align-top text-right tabular-nums text-slate-700">
+                    {% if s.distinct_count is none %}
+                        <span class="text-slate-400" title="skipped — wide text column">–</span>
+                    {% else %}
+                        {{ "{:,}".format(s.distinct_count) }}
+                    {% endif %}
+                </td>
+                <td class="px-2 py-1.5 align-top text-xs text-slate-600 max-w-sm truncate">
+                    {% if s.top_values %}
+                        {% set shown = s.top_values[:3] %}
+                        {% for val, cnt in shown %}
+                            {%- set display = val if val|length <= 40 else val[:37] ~ '…' -%}
+                            <span class="inline-block bg-slate-50 border border-slate-200 rounded px-1 py-0.5 mr-1 mb-0.5 text-[11px]"
+                                  title="{{ val }} ({{ cnt }})">
+                                {{ display }}<span class="text-slate-400 ml-1">·{{ cnt }}</span>
+                            </span>
+                        {% endfor %}
+                        {% if s.top_values|length > 3 %}
+                            <span class="text-slate-400 text-[11px]">+{{ s.top_values|length - 3 }}</span>
+                        {% endif %}
+                    {% else %}
+                        <span class="text-slate-300">—</span>
+                    {% endif %}
+                </td>
+                <td class="px-2 py-1.5 align-top font-mono text-[11px] text-slate-700 whitespace-nowrap">
+                    {{ s.suggested_type }}
+                </td>
+            </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+</form>
+
+{# ── DDL pop-out ── #}
+<div id="ddl-panel" class="hidden mt-4 bg-slate-900 text-emerald-200 rounded-lg shadow-lg overflow-hidden">
+    <div class="flex items-center justify-between px-4 py-2 bg-slate-800">
+        <div class="text-xs uppercase tracking-wide text-slate-300">Generated DDL (PostgreSQL)</div>
+        <div class="flex items-center gap-2 text-xs">
+            <button id="ddl-copy" type="button" class="bg-slate-700 hover:bg-slate-600 rounded px-2 py-1 text-slate-100">Copy</button>
+            <a id="ddl-open" href="#" target="_blank" class="bg-slate-700 hover:bg-slate-600 rounded px-2 py-1 text-slate-100">Open in new tab</a>
+            <button id="ddl-close" type="button" class="bg-slate-700 hover:bg-slate-600 rounded px-2 py-1 text-slate-100">Close</button>
+        </div>
+    </div>
+    <pre id="ddl-out" class="px-4 py-3 text-xs whitespace-pre overflow-auto max-h-[60vh]"></pre>
+</div>
+
+<style>
+  tr.row-empty.hide-empty { display: none; }
+</style>
+
+<script>
+(function() {
+    const form = document.getElementById('migrate-form');
+    const boxes = Array.from(form.querySelectorAll('.field-check'));
+    const rows = Array.from(form.querySelectorAll('.stats-row'));
+    const countEl = document.getElementById('sel-count');
+    const tbl = document.getElementById('stats-table');
+    const showPopulated = document.getElementById('show-populated');
+
+    function updateCount() {
+        const sel = boxes.filter(b => b.checked).length;
+        countEl.textContent = sel + ' of ' + boxes.length + ' fields selected';
+    }
+    boxes.forEach(b => b.addEventListener('change', updateCount));
+    updateCount();
+
+    document.getElementById('sel-all').addEventListener('click', () => {
+        boxes.forEach(b => { b.checked = true; });
+        updateCount();
+    });
+    document.getElementById('sel-none').addEventListener('click', () => {
+        boxes.forEach(b => { b.checked = false; });
+        updateCount();
+    });
+    document.getElementById('sel-populated').addEventListener('click', () => {
+        boxes.forEach(b => {
+            const row = b.closest('tr');
+            b.checked = !row.classList.contains('row-empty');
+        });
+        updateCount();
+    });
+
+    showPopulated.addEventListener('change', () => {
+        if (showPopulated.checked) {
+            tbl.querySelectorAll('tr.row-empty').forEach(r => r.classList.add('hide-empty'));
+        } else {
+            tbl.querySelectorAll('tr.row-empty').forEach(r => r.classList.remove('hide-empty'));
+        }
+    });
+
+    function selectedFields() {
+        return boxes.filter(b => b.checked).map(b => b.value);
+    }
+
+    const ddlPanel = document.getElementById('ddl-panel');
+    const ddlOut = document.getElementById('ddl-out');
+    const ddlOpen = document.getElementById('ddl-open');
+    const ddlCopy = document.getElementById('ddl-copy');
+    const ddlClose = document.getElementById('ddl-close');
+
+    document.getElementById('show-ddl').addEventListener('click', async () => {
+        const names = selectedFields();
+        if (!names.length) {
+            alert('Select at least one field first.');
+            return;
+        }
+        const url = '{{ url_for("sf.migrate_ddl", object_name=obj.name) }}' +
+                    '?fields=' + encodeURIComponent(names.join(','));
+        ddlOpen.href = url;
+        try {
+            const res = await fetch(url);
+            if (!res.ok) throw new Error('HTTP ' + res.status);
+            ddlOut.textContent = await res.text();
+            ddlPanel.classList.remove('hidden');
+            ddlPanel.scrollIntoView({behavior: 'smooth', block: 'nearest'});
+        } catch (e) {
+            ddlOut.textContent = 'Error loading DDL: ' + e.message;
+            ddlPanel.classList.remove('hidden');
+        }
+    });
+
+    ddlClose.addEventListener('click', () => ddlPanel.classList.add('hidden'));
+    ddlCopy.addEventListener('click', async () => {
+        try {
+            await navigator.clipboard.writeText(ddlOut.textContent);
+            ddlCopy.textContent = 'Copied!';
+            setTimeout(() => { ddlCopy.textContent = 'Copy'; }, 1200);
+        } catch (e) {
+            ddlCopy.textContent = 'Copy failed';
+        }
+    });
+})();
+</script>
+{% endblock %}

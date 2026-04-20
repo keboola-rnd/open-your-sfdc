@@ -1,0 +1,104 @@
+{% extends "base.html" %}
+{% block title %}SQL Query - SF Data Browser{% endblock %}
+
+{% block content %}
+<h1 class="text-2xl font-bold mb-2">SQL query editor</h1>
+<p class="text-sm text-slate-500 mb-4">
+    Read-only SQLite. Only a single <code>SELECT</code>, <code>WITH</code>, or <code>PRAGMA</code> statement is allowed.
+    Results are capped at 500 rows.
+</p>
+
+<div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+    <div class="md:col-span-2">
+        <form id="query-form" class="bg-white rounded shadow p-3">
+            <textarea id="sql" rows="10" class="w-full font-mono text-sm border rounded p-2"
+                      placeholder="SELECT name, label, record_count FROM _sf_objects ORDER BY record_count DESC LIMIT 20;">SELECT name, label, record_count FROM _sf_objects ORDER BY record_count DESC LIMIT 20;</textarea>
+            <div class="flex items-center gap-3 mt-2">
+                <button type="submit" class="bg-blue-600 hover:bg-blue-700 text-white text-sm rounded px-4 py-1.5">Run</button>
+                <span id="query-meta" class="text-xs text-slate-500"></span>
+            </div>
+        </form>
+
+        <div id="results" class="bg-white rounded shadow p-3 mt-4 overflow-auto">
+            <div class="text-sm text-slate-500">Results will appear here.</div>
+        </div>
+    </div>
+    <aside class="bg-white rounded shadow p-4 text-sm">
+        <h2 class="font-semibold mb-2">Examples</h2>
+        <ul class="space-y-2 text-xs">
+            <li>
+                <button class="text-blue-600 hover:underline" onclick="setSql(this.dataset.sql)"
+                        data-sql="SELECT name, label, record_count FROM _sf_objects ORDER BY record_count DESC LIMIT 20;">
+                    Top 20 objects by record count
+                </button>
+            </li>
+            <li>
+                <button class="text-blue-600 hover:underline" onclick="setSql(this.dataset.sql)"
+                        data-sql="SELECT object_name, COUNT(*) AS field_count FROM _sf_fields GROUP BY object_name ORDER BY field_count DESC LIMIT 20;">
+                    Widest objects (most fields)
+                </button>
+            </li>
+            <li>
+                <button class="text-blue-600 hover:underline" onclick="setSql(this.dataset.sql)"
+                        data-sql="SELECT from_object, from_field, to_object FROM _sf_relationships WHERE to_object = 'Account' LIMIT 50;">
+                    Inbound references to Account
+                </button>
+            </li>
+            <li>
+                <button class="text-blue-600 hover:underline" onclick="setSql(this.dataset.sql)"
+                        data-sql="SELECT Id, Name FROM Account ORDER BY CreatedDate DESC LIMIT 20;">
+                    Newest 20 Accounts
+                </button>
+            </li>
+        </ul>
+        <div class="mt-4 text-xs text-slate-500">
+            Meta-tables: <code>_sf_objects</code>, <code>_sf_fields</code>, <code>_sf_relationships</code>.
+        </div>
+    </aside>
+</div>
+
+<script>
+function setSql(sql) {
+    document.getElementById('sql').value = sql;
+}
+
+document.getElementById('query-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const sql = document.getElementById('sql').value;
+    const meta = document.getElementById('query-meta');
+    const results = document.getElementById('results');
+    meta.textContent = 'Running...';
+    const started = performance.now();
+    try {
+        const res = await fetch('{{ url_for("sf.api_query") }}', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ sql }),
+        });
+        const data = await res.json();
+        const elapsed = Math.round(performance.now() - started);
+        if (!res.ok) {
+            meta.textContent = `Error in ${elapsed}ms`;
+            results.innerHTML = `<div class="text-red-600 text-sm">${escapeHtml(data.error || 'error')}</div>`;
+            return;
+        }
+        meta.textContent = `${data.row_count} row(s) in ${elapsed}ms${data.truncated ? ' (truncated)' : ''}`;
+        results.innerHTML = renderTable(data.columns, data.rows);
+    } catch (err) {
+        meta.textContent = 'Network error';
+        results.innerHTML = `<div class="text-red-600 text-sm">${escapeHtml(err.message)}</div>`;
+    }
+});
+
+function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+function renderTable(cols, rows) {
+    if (!cols.length) return '<div class="text-sm text-slate-500">Empty result.</div>';
+    const head = cols.map(c => `<th class="py-1 px-2 text-left font-mono text-xs bg-slate-50">${escapeHtml(c)}</th>`).join('');
+    const body = rows.map(r => '<tr class="border-t">' + r.map(v => `<td class="py-1 px-2 align-top text-xs">${v === null ? '<span class="text-slate-400">null</span>' : escapeHtml(v)}</td>`).join('') + '</tr>').join('');
+    return `<table class="min-w-full text-sm"><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`;
+}
+</script>
+{% endblock %}

@@ -1,0 +1,58 @@
+{% extends "base.html" %}
+{% block title %}Search - SF Data Browser{% endblock %}
+
+{% block content %}
+<form action="{{ url_for('sf.search_view') }}" method="get" class="mb-6">
+    <div class="flex gap-2">
+        <input type="search" name="q" value="{{ query }}" placeholder="Search all objects (FTS5 syntax supported)..."
+               class="flex-1 border rounded-lg px-4 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-400"
+               autofocus>
+        <button class="bg-blue-600 hover:bg-blue-700 text-white text-sm rounded-lg px-5 py-2 transition-colors">Search</button>
+    </div>
+    <div class="text-xs text-slate-500 mt-1">
+        Uses SQLite FTS5 indexes built on each object's key text columns.
+        Diacritics are ignored (e.g. "Cerpadla" matches "CERPADLA").
+    </div>
+</form>
+
+{% if query %}
+    {% if results %}
+        <div class="text-sm text-slate-500 mb-4">
+            Found hits in {{ results|length }} object(s)
+            &middot; {{ results|sum(attribute='count') }} total result(s).
+        </div>
+        {% for group in results %}
+        <section class="bg-white rounded-lg shadow p-4 mb-4">
+            <h2 class="font-semibold flex items-center gap-2">
+                <a class="text-blue-700 hover:underline" href="{{ url_for('sf.table_view', object_name=group.object) }}">{{ group.object }}</a>
+                <span class="text-slate-400 text-sm font-normal">&middot; {{ group.count }} result(s)</span>
+            </h2>
+            <ul class="mt-2 space-y-2">
+                {% for r in group.records %}
+                <li class="border-b border-slate-100 pb-2 last:border-0">
+                    <div class="flex items-center gap-2">
+                        <a class="text-blue-700 hover:underline font-mono text-xs"
+                           href="{{ url_for('sf.record_view', object_name=group.object, record_id=r.Id) }}">{{ r.Id }}</a>
+                        {% if r.get('Name') %}<span class="font-medium">{{ r.Name }}</span>{% endif %}
+                        {% if r.get('Subject') and not r.get('Name') %}<span class="font-medium">{{ r.Subject }}</span>{% endif %}
+                    </div>
+                    {# Snippet showing WHERE the match was found #}
+                    {% if r.get('_snippet') %}
+                    <div class="mt-1 text-xs text-slate-600 bg-slate-50 rounded px-3 py-1.5">
+                        <span class="text-slate-400 font-mono mr-1">{{ r._snippet_col }}:</span>
+                        <span class="search-snippet">{{ r._snippet|safe }}</span>
+                    </div>
+                    {% endif %}
+                </li>
+                {% endfor %}
+            </ul>
+        </section>
+        {% endfor %}
+    {% else %}
+        <div class="text-slate-500 bg-white rounded-lg shadow p-6 text-center">
+            No results for "<strong>{{ query }}</strong>".
+            <div class="text-xs mt-2">Try a different search term. Diacritics are ignored.</div>
+        </div>
+    {% endif %}
+{% endif %}
+{% endblock %}

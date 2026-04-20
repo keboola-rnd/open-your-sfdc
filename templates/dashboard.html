@@ -1,0 +1,161 @@
+{% extends "base.html" %}
+{% block title %}Dashboard - SF Data Browser{% endblock %}
+
+{% block content %}
+{# ── Stats cards ── #}
+<section class="grid grid-cols-1 md:grid-cols-4 gap-4 mb-8">
+    <div class="bg-white rounded-lg shadow p-4 border-l-4 border-blue-500">
+        <div class="text-xs uppercase text-slate-500">Objects</div>
+        <div class="text-3xl font-bold">{{ total_objects }}</div>
+        <div class="text-xs text-slate-400 mt-1">{{ non_empty_count }} with data</div>
+    </div>
+    <div class="bg-white rounded-lg shadow p-4 border-l-4 border-emerald-500">
+        <div class="text-xs uppercase text-slate-500">Records</div>
+        <div class="text-3xl font-bold">{{ "{:,}".format(total_records) }}</div>
+    </div>
+    <div class="bg-white rounded-lg shadow p-4 border-l-4 border-amber-500">
+        <div class="text-xs uppercase text-slate-500">Custom objects</div>
+        <div class="text-3xl font-bold">{{ custom_count }}</div>
+    </div>
+    <div class="bg-white rounded-lg shadow p-4 border-l-4 border-slate-400">
+        <div class="text-xs uppercase text-slate-500">Exported at</div>
+        <div class="text-sm font-semibold mt-1">{{ exported_at or '–' }}</div>
+    </div>
+</section>
+
+{# ── Key Salesforce objects ── #}
+<section class="bg-white rounded-lg shadow p-4 mb-6">
+    <h2 class="text-lg font-semibold mb-3">Key objects</h2>
+    <div class="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-3">
+        {% for o in key_objects %}
+        <a href="{{ url_for('sf.table_view', object_name=o.name) }}"
+           class="block border border-slate-200 rounded-lg p-3 hover:bg-blue-50 hover:border-blue-300 transition-colors">
+            <div class="font-mono text-sm font-medium text-blue-700">{{ o.name }}</div>
+            <div class="text-xs text-slate-400 mt-0.5 line-clamp-2" title="{{ o.description }}">{{ o.description or o.label }}</div>
+            <div class="text-lg font-bold mt-1">{{ "{:,}".format(o.record_count or 0) }}</div>
+        </a>
+        {% endfor %}
+    </div>
+</section>
+
+{# ── All objects with data ── #}
+<section class="bg-white rounded-lg shadow p-4 mb-6">
+    <div class="flex items-center justify-between mb-4 gap-4">
+        <h2 class="text-lg font-semibold">
+            All objects with data
+            <span class="text-sm font-normal text-slate-400">({{ non_empty_objects|length }})</span>
+        </h2>
+        <input id="object-filter" type="search" placeholder="Filter objects..."
+               class="border rounded-lg px-3 py-1.5 text-sm w-64 focus:outline-none focus:ring-2 focus:ring-blue-400"
+               oninput="filterObjects(this.value)">
+    </div>
+    <table class="min-w-full text-sm">
+        <thead>
+            <tr class="text-left text-slate-600 border-b">
+                <th class="py-2 pr-4 cursor-pointer hover:text-blue-600" onclick="sortTable('name')">Name <span id="sort-name"></span></th>
+                <th class="py-2 pr-4 cursor-pointer hover:text-blue-600" onclick="sortTable('label')">Label / Description <span id="sort-label"></span></th>
+                <th class="py-2 pr-4 text-right cursor-pointer hover:text-blue-600" onclick="sortTable('records')">Records <span id="sort-records"></span></th>
+                <th class="py-2 pr-4">Type</th>
+                <th class="py-2 pr-4">Actions</th>
+            </tr>
+        </thead>
+        <tbody id="object-tbody">
+            {% for o in non_empty_objects %}
+            <tr class="border-b hover:bg-slate-50 object-row" data-name="{{ o.name | lower }}" data-label="{{ o.label | lower }}" data-records="{{ o.record_count or 0 }}">
+                <td class="py-2 pr-4"><a class="text-blue-700 hover:underline font-mono" href="{{ url_for('sf.table_view', object_name=o.name) }}">{{ o.name }}</a></td>
+                <td class="py-2 pr-4">
+                    <div class="text-slate-600">{{ o.label }}</div>
+                    {% if o.description and o.description != o.label %}<div class="text-xs text-slate-400">{{ o.description }}</div>{% endif %}
+                </td>
+                <td class="py-2 pr-4 text-right font-mono">{{ "{:,}".format(o.record_count or 0) }}</td>
+                <td class="py-2 pr-4">
+                    {% if o.custom %}
+                        <span class="bg-amber-100 text-amber-800 text-xs px-2 py-0.5 rounded">custom</span>
+                    {% else %}
+                        <span class="bg-slate-100 text-slate-700 text-xs px-2 py-0.5 rounded">standard</span>
+                    {% endif %}
+                </td>
+                <td class="py-2 pr-4 space-x-3">
+                    <a class="text-blue-600 hover:underline text-xs" href="{{ url_for('sf.table_view', object_name=o.name) }}">data</a>
+                    <a class="text-blue-600 hover:underline text-xs" href="{{ url_for('sf.schema_view', object_name=o.name) }}">schema</a>
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</section>
+
+{# ── Empty objects (collapsed by default) ── #}
+{% if empty_objects %}
+<section class="bg-white rounded-lg shadow p-4 mb-6">
+    <button onclick="document.getElementById('empty-objects').classList.toggle('hidden'); this.querySelector('#toggle-label').textContent = document.getElementById('empty-objects').classList.contains('hidden') ? 'show' : 'hide'"
+            class="text-sm text-slate-500 cursor-pointer hover:text-slate-700">
+        Empty objects ({{ empty_count }}) &middot; <span id="toggle-label">show</span>
+    </button>
+    <table id="empty-objects" class="hidden min-w-full text-sm mt-3">
+        <thead>
+            <tr class="text-left text-slate-600 border-b">
+                <th class="py-2 pr-4">Name</th>
+                <th class="py-2 pr-4">Label</th>
+                <th class="py-2 pr-4">Type</th>
+                <th class="py-2 pr-4">Actions</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for o in empty_objects %}
+            <tr class="border-b hover:bg-slate-50 object-row" data-name="{{ o.name | lower }}">
+                <td class="py-2 pr-4 text-slate-400 font-mono">{{ o.name }}</td>
+                <td class="py-2 pr-4 text-slate-400">{{ o.label }}</td>
+                <td class="py-2 pr-4">
+                    {% if o.custom %}
+                        <span class="bg-amber-50 text-amber-600 text-xs px-2 py-0.5 rounded">custom</span>
+                    {% else %}
+                        <span class="bg-slate-50 text-slate-500 text-xs px-2 py-0.5 rounded">standard</span>
+                    {% endif %}
+                </td>
+                <td class="py-2 pr-4">
+                    <a class="text-blue-400 hover:underline text-xs" href="{{ url_for('sf.schema_view', object_name=o.name) }}">schema</a>
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</section>
+{% endif %}
+
+<script>
+    function filterObjects(needle) {
+        const n = needle.trim().toLowerCase();
+        document.querySelectorAll('.object-row').forEach(row => {
+            const name = row.dataset.name || '';
+            const label = row.dataset.label || '';
+            row.style.display = !n || name.includes(n) || label.includes(n) ? '' : 'none';
+        });
+    }
+
+    let currentSort = { col: null, dir: 'asc' };
+    function sortTable(col) {
+        const tbody = document.getElementById('object-tbody');
+        const rows = Array.from(tbody.querySelectorAll('tr.object-row'));
+        const dir = (currentSort.col === col && currentSort.dir === 'asc') ? 'desc' : 'asc';
+        currentSort = { col, dir };
+
+        rows.sort((a, b) => {
+            let va = a.dataset[col] || '';
+            let vb = b.dataset[col] || '';
+            if (col === 'records') {
+                va = parseInt(va) || 0;
+                vb = parseInt(vb) || 0;
+                return dir === 'asc' ? va - vb : vb - va;
+            }
+            return dir === 'asc' ? va.localeCompare(vb) : vb.localeCompare(va);
+        });
+        rows.forEach(r => tbody.appendChild(r));
+
+        // Update sort indicators.
+        document.querySelectorAll('[id^="sort-"]').forEach(s => s.textContent = '');
+        const indicator = document.getElementById('sort-' + col);
+        if (indicator) indicator.textContent = dir === 'asc' ? ' ↑' : ' ↓';
+    }
+</script>
+{% endblock %}

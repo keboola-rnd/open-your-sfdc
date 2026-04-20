@@ -1,0 +1,223 @@
+{% extends "base.html" %}
+{% block title %}{{ obj.name }} - Table{% endblock %}
+
+{% macro sort_link(col) -%}
+    {%- set next_dir = 'desc' if sort == col and sort_dir == 'asc' else 'asc' -%}
+    {%- set args = request.args.to_dict() -%}
+    {%- set _ = args.update({'sort': col, 'dir': next_dir}) -%}
+    {{ url_for('sf.table_view', object_name=obj.name, **args) }}
+{%- endmacro %}
+
+{% block content %}
+<div class="flex items-center justify-between mb-4">
+    <div>
+        <div class="text-xs text-slate-500">
+            <a href="{{ url_for('sf.dashboard') }}" class="hover:underline">Objects</a> / {{ obj.label }}
+        </div>
+        <h1 class="text-2xl font-bold font-mono">{{ obj.name }}</h1>
+        <div class="text-sm text-slate-500">
+            {{ obj.label }}
+            &middot; {{ "{:,}".format(total) }} records matching filter
+            &middot; {{ "{:,}".format(obj.record_count or 0) }} total
+        </div>
+        {% if obj_description %}
+        <div class="text-xs text-slate-400 mt-0.5">{{ obj_description }}</div>
+        {% endif %}
+    </div>
+    <div class="flex items-center gap-2">
+        <a class="text-sm bg-slate-100 hover:bg-slate-200 rounded px-3 py-1.5 transition-colors" href="{{ url_for('sf.schema_view', object_name=obj.name) }}">Schema</a>
+        <a class="text-sm bg-indigo-600 hover:bg-indigo-700 text-white rounded px-3 py-1.5 transition-colors"
+           href="{{ url_for('sf.migrate_object', object_name=obj.name) }}">Migrate this object</a>
+        <a class="text-sm bg-emerald-600 hover:bg-emerald-700 text-white rounded px-3 py-1.5 transition-colors"
+           href="{{ url_for('sf.export_table_csv', object_name=obj.name, **request.args) }}">Export CSV</a>
+    </div>
+</div>
+
+{# ── Filter bar ── #}
+<form method="get" class="bg-white rounded-lg shadow p-3 mb-4" id="filter-form">
+    <input type="hidden" name="sort" value="{{ sort or '' }}">
+    <input type="hidden" name="dir" value="{{ sort_dir }}">
+    {% if show_all %}<input type="hidden" name="all_cols" value="1">{% endif %}
+
+    <div class="flex flex-wrap items-center gap-2">
+        <label class="text-xs text-slate-500">Filters:</label>
+
+        {# Existing active filters with value suggestions #}
+        {% for col, val in filters.items() %}
+        {% set fmeta = fields_map.get(col) %}
+        {% set col_label = (fmeta.label if fmeta and fmeta.label else col) %}
+        {% set is_ref = fmeta and fmeta.sf_type == 'reference' %}
+        <div class="flex items-center gap-1 bg-blue-50 border border-blue-200 rounded px-2 py-1">
+            <span class="text-xs text-slate-500" title="{{ col }}">{{ col_label }}:</span>
+            {% if filter_suggestions.get(col) %}
+                {# Autocomplete from distinct values — references show resolved names #}
+                <input name="f_{{ col }}" value="{{ val }}" list="dl_{{ col }}"
+                       placeholder="{{ 'name or Id' if is_ref else col_label ~ '...' }}"
+                       class="border-0 bg-transparent text-sm w-52 focus:outline-none">
+                <datalist id="dl_{{ col }}">
+                    {% for sv in filter_suggestions[col] %}
+                    <option value="{{ sv }}">
+                    {% endfor %}
+                </datalist>
+            {% else %}
+                <input name="f_{{ col }}" value="{{ val }}"
+                       placeholder="{{ 'name or Id' if is_ref else col_label ~ '...' }}"
+                       class="border-0 bg-transparent text-sm w-40 focus:outline-none">
+            {% endif %}
+            {% if filter_display.get(col) %}
+                <span class="text-[10px] text-slate-500 italic ml-1"
+                      title="Name resolved to matching IDs">
+                    {{ filter_display[col] }}
+                </span>
+            {% endif %}
+            <a href="javascript:void(0)" onclick="this.parentElement.querySelector('input').value=''; this.closest('form').submit()"
+               class="text-red-400 hover:text-red-600 text-xs ml-1" title="Remove filter">&times;</a>
+        </div>
+        {% endfor %}
+
+        {# Add new filter — creates input in-place #}
+        <div class="relative" id="add-filter-wrapper">
+            <select id="add-filter-col" class="border rounded px-2 py-1 text-xs text-slate-600 bg-white">
+                <option value="">+ Add filter...</option>
+                {% for col in filterable_cols %}
+                    {% if col not in filters %}
+                    {% set fmeta = fields_map.get(col) %}
+                    {% set flabel = (fmeta.label if fmeta and fmeta.label else col) %}
+                    <option value="{{ col }}"
+                            data-label="{{ flabel }}"
+                            data-type="{{ fmeta.sf_type if fmeta else '' }}">
+                        {{ flabel }}{% if fmeta %} ({{ fmeta.sf_type }}){% endif %}
+                    </option>
+                    {% endif %}
+                {% endfor %}
+            </select>
+        </div>
+
+        <label class="text-xs text-slate-500 ml-4">Page size:</label>
+        <select name="page_size" class="border rounded px-2 py-1 text-sm">
+            {% for ps in [25, 50, 100, 250] %}
+            <option value="{{ ps }}" {% if page_size == ps %}selected{% endif %}>{{ ps }}</option>
+            {% endfor %}
+        </select>
+        <button class="bg-blue-600 hover:bg-blue-700 text-white text-sm rounded px-3 py-1 transition-colors">Apply</button>
+        {% if filters or sort %}
+        <a href="{{ url_for('sf.table_view', object_name=obj.name) }}" class="text-xs text-slate-500 hover:underline ml-2">Reset</a>
+        {% endif %}
+    </div>
+</form>
+
+{# ── Column toggle ── #}
+{% if all_cols_count > cols|length or show_all %}
+<div class="flex items-center justify-between mb-2 text-xs text-slate-500">
+    <span>Showing {{ cols|length }} of {{ all_cols_count }} columns</span>
+    {% if show_all %}
+        {% set toggle_args = request.args.to_dict() %}
+        {% set _ = toggle_args.pop('all_cols', None) %}
+        <a href="{{ url_for('sf.table_view', object_name=obj.name, **toggle_args) }}" class="text-blue-600 hover:underline">Show smart columns</a>
+    {% else %}
+        {% set toggle_args = request.args.to_dict() %}
+        {% set _ = toggle_args.update({'all_cols': '1'}) %}
+        <a href="{{ url_for('sf.table_view', object_name=obj.name, **toggle_args) }}" class="text-blue-600 hover:underline">Show all {{ all_cols_count }} columns</a>
+    {% endif %}
+</div>
+{% endif %}
+
+{# ── Data table ── #}
+<div class="bg-white rounded-lg shadow overflow-auto" style="max-height: 75vh;">
+    <table class="min-w-full text-sm">
+        <thead class="sticky top-0 bg-slate-100 z-10">
+            <tr class="text-left border-b">
+                {% for col in cols %}
+                    {% set fmeta = fields_map.get(col) %}
+                    <th class="py-2 px-3 font-mono text-xs text-slate-700 whitespace-nowrap">
+                        <a href="{{ sort_link(col) }}" class="hover:underline">
+                            {{ fmeta.label if fmeta and fmeta.label else col }}
+                            {% if sort == col %}
+                                <span class="text-blue-600">{{ '↓' if sort_dir == 'desc' else '↑' }}</span>
+                            {% endif %}
+                        </a>
+                        {% if fmeta %}<div class="text-[10px] text-slate-400 font-sans font-normal">{{ col }} &middot; {{ fmeta.sf_type }}</div>{% endif %}
+                    </th>
+                {% endfor %}
+            </tr>
+        </thead>
+        <tbody>
+            {% for row in rows %}
+            <tr class="border-b hover:bg-slate-50">
+                {% for col in cols %}
+                    {% set fmeta = fields_map.get(col) %}
+                    <td class="py-1.5 px-3 whitespace-nowrap align-top max-w-xs truncate">
+                        {% if col == 'Id' %}
+                            <a class="text-blue-700 hover:underline font-mono" href="{{ url_for('sf.record_view', object_name=obj.name, record_id=row[col]) }}">{{ row[col] }}</a>
+                        {% else %}
+                            {{ render_cell(row[col], fmeta.sf_type if fmeta else None, fmeta.reference_to if fmeta else None, url_for_record, prefix_map=prefix_map, table_names=table_names) }}
+                        {% endif %}
+                    </td>
+                {% endfor %}
+            </tr>
+            {% else %}
+            <tr><td colspan="{{ cols|length }}" class="text-center text-slate-500 py-6">No records.</td></tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
+
+{# ── Pagination ── #}
+<nav class="flex items-center justify-between mt-4 text-sm">
+    <div class="text-slate-500">Page {{ page }} of {{ total_pages }}</div>
+    <div class="space-x-2">
+        {% set args = request.args.to_dict() %}
+        {% if page > 1 %}
+            {% set _ = args.update({'page': page - 1}) %}
+            <a class="bg-white border rounded px-3 py-1 hover:bg-slate-100 transition-colors" href="{{ url_for('sf.table_view', object_name=obj.name, **args) }}">&larr; Prev</a>
+        {% endif %}
+        {% if page < total_pages %}
+            {% set _ = args.update({'page': page + 1}) %}
+            <a class="bg-white border rounded px-3 py-1 hover:bg-slate-100 transition-colors" href="{{ url_for('sf.table_view', object_name=obj.name, **args) }}">Next &rarr;</a>
+        {% endif %}
+    </div>
+</nav>
+
+<script>
+document.getElementById('add-filter-col').addEventListener('change', async function() {
+    if (!this.value) return;
+    const col = this.value;
+    const selectedOption = this.options[this.selectedIndex];
+    const colLabel = selectedOption.dataset.label || col;
+    const isRef = selectedOption.dataset.type === 'reference';
+    const wrapper = document.getElementById('add-filter-wrapper');
+    const objName = '{{ obj.name }}';
+
+    // Create visible input for the new filter.
+    const div = document.createElement('div');
+    div.className = 'flex items-center gap-1 bg-blue-50 border border-blue-200 rounded px-2 py-1';
+    const dlId = 'dl_new_' + col;
+    const placeholder = isRef ? 'name or Id' : (colLabel + '...');
+    div.innerHTML =
+        '<span class="text-xs text-slate-500" title="' + col + '">' + colLabel + ':</span>' +
+        '<input name="f_' + col + '" placeholder="' + placeholder + '" list="' + dlId + '" ' +
+        'class="border-0 bg-transparent text-sm w-52 focus:outline-none">' +
+        '<datalist id="' + dlId + '"></datalist>' +
+        '<a href="javascript:void(0)" onclick="this.parentElement.remove()" ' +
+        'class="text-red-400 hover:text-red-600 text-xs ml-1" title="Remove">&times;</a>';
+    wrapper.parentElement.insertBefore(div, wrapper);
+    const input = div.querySelector('input');
+    input.focus();
+    this.value = '';
+
+    // Fetch distinct values for autocomplete (resolved names for references).
+    try {
+        const res = await fetch('/api/table/' + objName + '/distinct/' + col);
+        if (res.ok) {
+            const data = await res.json();
+            const dl = div.querySelector('datalist');
+            data.values.forEach(v => {
+                const opt = document.createElement('option');
+                opt.value = v;
+                dl.appendChild(opt);
+            });
+        }
+    } catch(e) { /* ignore */ }
+});
+</script>
+{% endblock %}

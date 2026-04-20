@@ -1,0 +1,552 @@
+{% extends "base.html" %}
+{% block title %}{{ record_title }} · {{ obj.name }}{% endblock %}
+
+{# =======================================================================
+   Keboola view — Lightning-inspired business layout.
+
+   Toggle back to the raw view via the view switcher next to the breadcrumb.
+   The raw view remains authoritative for forensics and migration SQL work.
+   ======================================================================= #}
+
+{% macro kb_field(f, record, render_keboola, url_for_record, prefix_map, name_cache) %}
+    {% set val = record.get(f.field_name) %}
+    {% set is_empty = val is none or val == '' %}
+    <div class="flex items-start border-b border-slate-100 py-1.5
+                {% if is_empty %}opacity-60 kb-field-empty{% endif %}">
+        <dt class="w-2/5 text-slate-500 text-xs pt-0.5 flex items-center gap-1">
+            <span title="{{ f.field_name }} ({{ f.sf_type }})">{{ f.label or f.field_name }}</span>
+        </dt>
+        <dd class="w-3/5 text-sm break-all">
+            {{ render_keboola(val, f, url_for_record,
+                              prefix_map=prefix_map, name_cache=name_cache) }}
+        </dd>
+    </div>
+{% endmacro %}
+
+{% macro kb_highlight(f, record, render_keboola, url_for_record, prefix_map, name_cache) %}
+    <div class="min-w-30 px-3 border-r border-slate-200 last:border-r-0">
+        <div class="text-[10px] uppercase tracking-wide text-slate-500">
+            {{ f.label or f.field_name }}
+        </div>
+        <div class="text-sm font-medium mt-0.5">
+            {{ render_keboola(record.get(f.field_name), f, url_for_record,
+                              prefix_map=prefix_map, name_cache=name_cache) }}
+        </div>
+    </div>
+{% endmacro %}
+
+{% block content %}
+{# ── Breadcrumb, Title, View Switcher ── #}
+<div class="mb-4">
+    <div class="text-xs text-slate-500 flex items-center justify-between">
+        <div>
+            <a href="{{ url_for('sf.dashboard') }}" class="hover:underline">Objects</a> /
+            <a href="{{ url_for('sf.table_view', object_name=obj.name) }}" class="hover:underline">{{ obj.label }}</a> /
+            <span class="font-mono">{{ record.Id }}</span>
+        </div>
+        <div class="flex text-xs rounded-md border border-slate-300 overflow-hidden">
+            <span class="px-3 py-1 bg-blue-600 text-white font-medium">Keboola</span>
+            <a href="{{ url_for('sf.record_view_raw', object_name=obj.name, record_id=record.Id) }}"
+               class="px-3 py-1 text-slate-600 hover:bg-slate-100">Raw</a>
+        </div>
+    </div>
+    <h1 class="text-2xl font-bold mt-1">{{ record_title }}</h1>
+    <div class="text-sm text-slate-500 flex items-center gap-3">
+        <span>{{ obj.name }}</span>
+        <a href="{{ url_for('sf.schema_view', object_name=obj.name) }}" class="text-blue-600 hover:underline text-xs">schema</a>
+    </div>
+</div>
+
+{# ── Highlights strip ── #}
+{% if highlights %}
+<section class="bg-white rounded-lg shadow-sm border border-slate-200 py-3 mb-4 flex flex-wrap items-center">
+    {% for f in highlights %}
+        {{ kb_highlight(f, record, render_keboola, url_for_record, prefix_map, name_cache) }}
+    {% endfor %}
+</section>
+{% endif %}
+
+{# ── EmailMessage context (kept from raw view — useful in Keboola too) ── #}
+{% if email_context %}
+<section class="bg-blue-50 border border-blue-200 rounded-lg p-4 mb-4">
+    <h2 class="text-sm font-semibold text-blue-900 mb-3">Email context</h2>
+    <div class="grid grid-cols-1 md:grid-cols-2 gap-4 text-sm">
+        {% if email_context.related_to %}
+        <div>
+            <span class="text-slate-500">Related to:</span>
+            <a class="text-blue-700 hover:underline font-medium ml-1"
+               href="{{ url_for('sf.record_view', object_name=email_context.related_to.object, record_id=email_context.related_to.id) }}">
+                {{ email_context.related_to.name }}
+            </a>
+            <span class="text-xs text-slate-400 ml-1">({{ email_context.related_to.object }})</span>
+        </div>
+        {% endif %}
+        {% if email_context.activity %}
+        <div>
+            <span class="text-slate-500">Activity:</span>
+            <a class="text-blue-700 hover:underline font-medium ml-1"
+               href="{{ url_for('sf.record_view', object_name=email_context.activity.object, record_id=email_context.activity.id) }}">
+                {{ email_context.activity.name }}
+            </a>
+            <span class="text-xs text-slate-400 ml-1">({{ email_context.activity.object }})</span>
+        </div>
+        {% endif %}
+        {% if email_context.reply_to %}
+        <div>
+            <span class="text-slate-500">Reply to:</span>
+            <a class="text-blue-700 hover:underline ml-1"
+               href="{{ url_for('sf.record_view', object_name='EmailMessage', record_id=email_context.reply_to.id) }}">
+                {{ email_context.reply_to.subject }}
+            </a>
+        </div>
+        {% endif %}
+    </div>
+    {% if email_context.participants %}
+    <div class="mt-3">
+        <span class="text-xs text-slate-500 uppercase tracking-wide">Participants</span>
+        <div class="mt-1 space-y-1">
+            {% for p in email_context.participants %}
+            <div class="flex items-center gap-2 text-sm">
+                <span class="inline-block w-20 text-xs font-mono
+                    {% if p.RelationType == 'FromAddress' %}text-green-700 bg-green-50 border border-green-200
+                    {% elif p.RelationType == 'ToAddress' %}text-blue-700 bg-blue-100 border border-blue-200
+                    {% else %}text-slate-600 bg-slate-100 border border-slate-200
+                    {% endif %} rounded px-1.5 py-0.5 text-center">
+                    {{ p.RelationType|replace('Address', '') }}
+                </span>
+                <span>{{ p.RelationAddress or '–' }}</span>
+                {% if p._relation_name %}
+                    <a class="text-blue-700 hover:underline text-xs"
+                       href="{{ url_for('sf.record_view', object_name=p._relation_object, record_id=p.RelationId) }}">
+                        {{ p._relation_name }}
+                    </a>
+                    <span class="text-xs text-slate-400">({{ p._relation_object or p.RelationObjectType }})</span>
+                {% elif p.RelationObjectType %}
+                    <span class="text-xs text-slate-400">({{ p.RelationObjectType }})</span>
+                {% endif %}
+            </div>
+            {% endfor %}
+        </div>
+    </div>
+    {% endif %}
+</section>
+{% endif %}
+
+{# ── Section toolbar: collapse / expand all ── #}
+<div class="flex items-center justify-end gap-2 mb-2 text-xs">
+    <button type="button" id="foldExpandAll"
+            class="px-2 py-1 rounded border border-slate-300 bg-white text-slate-600 hover:bg-slate-100 transition-colors"
+            title="Expand all sections">
+        <span class="inline-block w-3">▾</span> expand all
+    </button>
+    <button type="button" id="foldCollapseAll"
+            class="px-2 py-1 rounded border border-slate-300 bg-white text-slate-600 hover:bg-slate-100 transition-colors"
+            title="Collapse all sections">
+        <span class="inline-block w-3">▸</span> collapse all
+    </button>
+</div>
+
+{# ── Details tab content — sections in 2-column grid ── #}
+<div class="grid grid-cols-1 lg:grid-cols-3 gap-4">
+    {# LEFT: details + related lists #}
+    <div class="lg:col-span-2 space-y-4">
+
+        {# Details sections — each is a <details> so the user can fold it.
+           Sections with populated fields start open; empty-only ones closed. #}
+        {% for section in sections %}
+        <details class="kb-section bg-white rounded-lg shadow-sm border border-slate-200 group"
+                 {% if section.has_populated %}open{% endif %}>
+            <summary class="text-sm font-semibold text-slate-700 px-4 py-2 border-b border-slate-200 bg-slate-50 rounded-t-lg cursor-pointer list-none flex items-center justify-between hover:bg-slate-100">
+                <span>
+                    <span class="chevron text-slate-400">▸</span>
+                    {{ section.title }}
+                    <span class="text-slate-400 font-normal text-xs ml-1">
+                        {{ section.populated_count }} of {{ section.total_count }}
+                    </span>
+                </span>
+            </summary>
+            <dl class="grid grid-cols-1 md:grid-cols-2 gap-x-6 px-4 py-2">
+                {% for f in section.fields %}
+                    {{ kb_field(f, record, render_keboola, url_for_record, prefix_map, name_cache) }}
+                {% endfor %}
+            </dl>
+        </details>
+        {% endfor %}
+
+        {% if not sections %}
+        <section class="bg-white rounded-lg shadow-sm border border-slate-200 p-4">
+            <p class="text-sm text-slate-500">
+                No populated fields in known sections. Try the
+                <a class="text-blue-700 hover:underline"
+                   href="{{ url_for('sf.record_view_raw', object_name=obj.name, record_id=record.Id) }}">raw view</a>.
+            </p>
+        </section>
+        {% endif %}
+
+        {# Priority related lists — each child object gets its own foldable
+           section, so the user can collapse Orders independently of Contacts. #}
+        {% for group in priority_related %}
+        {% set cols = related_columns(group.object, group.preview[0].keys() if group.preview else []) %}
+        <details class="kb-section bg-white rounded-lg shadow-sm border border-slate-200 group" open>
+            <summary class="text-sm font-semibold text-slate-700 px-4 py-2 border-b border-slate-200 bg-slate-50 rounded-t-lg cursor-pointer list-none flex items-center justify-between hover:bg-slate-100">
+                <span>
+                    <span class="chevron text-slate-400">▸</span>
+                    <a class="text-blue-700 hover:underline"
+                       href="{{ url_for('sf.table_view', object_name=group.object, **{'f_' ~ group.field: record.Id}) }}"
+                       onclick="event.stopPropagation()">
+                        {{ group.object }}
+                    </a>
+                    <span class="text-slate-400 font-normal text-xs ml-1">
+                        ({{ "{:,}".format(group.count) }})
+                    </span>
+                </span>
+            </summary>
+            {% if group.preview and cols %}
+            {% set child_map = child_fields_map.get(group.object, {}) %}
+            {% set child_cache = child_name_cache.get(group.object, {}) %}
+            <div class="overflow-auto px-4 py-2">
+                <table class="text-xs min-w-full">
+                    <thead>
+                        <tr class="text-slate-500">
+                            {% for c in cols %}
+                            <th class="px-2 py-1 text-left font-normal uppercase tracking-wide text-[10px]">{{ c }}</th>
+                            {% endfor %}
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for r in group.preview[:10] %}
+                        <tr class="border-t border-slate-100 hover:bg-slate-50">
+                            {% for c in cols %}
+                            <td class="px-2 py-1 align-top">
+                                {% if c == 'Id' %}
+                                    <a class="text-blue-700 hover:underline font-mono text-[11px]"
+                                       href="{{ url_for('sf.record_view', object_name=group.object, record_id=r.Id) }}">
+                                        {{ r.Id[:8] }}…
+                                    </a>
+                                {% else %}
+                                    {% set cell_field = child_map.get(c) %}
+                                    {% if cell_field %}
+                                        {% set row_cache = {} %}
+                                        {% if cell_field.sf_type == 'reference' and r.get(c) and child_cache.get(r[c]) %}
+                                            {% set row_cache = {c: child_cache[r[c]]} %}
+                                        {% endif %}
+                                        {{ render_keboola(r.get(c), cell_field, url_for_record,
+                                                          prefix_map=prefix_map, name_cache=row_cache) }}
+                                    {% else %}
+                                        {{ r.get(c) or '' }}
+                                    {% endif %}
+                                {% endif %}
+                            </td>
+                            {% endfor %}
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+                {% if group.count > group.preview|length %}
+                <div class="mt-1">
+                    <a class="text-xs text-blue-600 hover:underline"
+                       href="{{ url_for('sf.table_view', object_name=group.object, **{'f_' ~ group.field: record.Id}) }}">
+                        View all {{ "{:,}".format(group.count) }} →
+                    </a>
+                </div>
+                {% endif %}
+            </div>
+            {% endif %}
+        </details>
+        {% endfor %}
+
+        {# More related lists — closed by default, native <details>. #}
+        {% if more_related %}
+        <details class="kb-section bg-white rounded-lg shadow-sm border border-slate-200 group">
+            <summary class="text-sm font-semibold text-slate-700 px-4 py-2 border-b border-slate-200 bg-slate-50 rounded-t-lg cursor-pointer list-none flex items-center justify-between hover:bg-slate-100">
+                <span>
+                    <span class="chevron text-slate-400">▸</span>
+                    More related
+                    <span class="text-slate-400 font-normal text-xs ml-1">({{ more_related|length }})</span>
+                </span>
+            </summary>
+            <div class="divide-y divide-slate-100">
+                {% for group in more_related %}
+                <div class="px-4 py-2">
+                    <a class="text-sm text-blue-700 hover:underline"
+                       href="{{ url_for('sf.table_view', object_name=group.object, **{'f_' ~ group.field: record.Id}) }}">
+                        {{ group.object }}
+                    </a>
+                    <span class="text-slate-500 text-xs">
+                        &middot; via {{ group.field }} &middot; {{ "{:,}".format(group.count) }} records
+                    </span>
+                </div>
+                {% endfor %}
+            </div>
+        </details>
+        {% endif %}
+
+    </div>
+
+    {# RIGHT: metadata / audit sidebar #}
+    <aside class="lg:col-span-1 space-y-4">
+        <section class="bg-white rounded-lg shadow-sm border border-slate-200 p-4">
+            <h2 class="text-xs uppercase tracking-wide text-slate-500 mb-2">Record</h2>
+            <dl class="text-xs space-y-1">
+                <div class="flex gap-2">
+                    <dt class="text-slate-500 w-20 shrink-0">Object</dt>
+                    <dd class="font-medium">{{ obj.name }}
+                        {% if obj.custom %}<span class="text-[9px] text-amber-600 ml-1">custom</span>{% endif %}
+                    </dd>
+                </div>
+                <div class="flex gap-2">
+                    <dt class="text-slate-500 w-20 shrink-0">SFDC Id</dt>
+                    <dd class="font-mono text-[11px] break-all">{{ record.Id }}</dd>
+                </div>
+                {% if record.get('CreatedDate') %}
+                <div class="flex gap-2">
+                    <dt class="text-slate-500 w-20 shrink-0">Created</dt>
+                    <dd>
+                        {% set created_field = fields_map.get('CreatedDate') %}
+                        {% if created_field %}
+                            {{ render_keboola(record.CreatedDate, created_field, url_for_record) }}
+                        {% endif %}
+                        {% if name_cache.get('CreatedById') %}
+                            by
+                            <a class="text-blue-700 hover:underline"
+                               href="{{ url_for('sf.record_view', object_name='User', record_id=record.CreatedById) }}">
+                                {{ name_cache.CreatedById[1] }}
+                            </a>
+                        {% endif %}
+                    </dd>
+                </div>
+                {% endif %}
+                {% if record.get('LastModifiedDate') %}
+                <div class="flex gap-2">
+                    <dt class="text-slate-500 w-20 shrink-0">Modified</dt>
+                    <dd>
+                        {% set mod_field = fields_map.get('LastModifiedDate') %}
+                        {% if mod_field %}
+                            {{ render_keboola(record.LastModifiedDate, mod_field, url_for_record) }}
+                        {% endif %}
+                        {% if name_cache.get('LastModifiedById') %}
+                            by
+                            <a class="text-blue-700 hover:underline"
+                               href="{{ url_for('sf.record_view', object_name='User', record_id=record.LastModifiedById) }}">
+                                {{ name_cache.LastModifiedById[1] }}
+                            </a>
+                        {% endif %}
+                    </dd>
+                </div>
+                {% endif %}
+                {% if record.get('OwnerId') and name_cache.get('OwnerId') %}
+                <div class="flex gap-2">
+                    <dt class="text-slate-500 w-20 shrink-0">Owner</dt>
+                    <dd>
+                        <a class="text-blue-700 hover:underline"
+                           href="{{ url_for('sf.record_view', object_name='User', record_id=record.OwnerId) }}">
+                            {{ name_cache.OwnerId[1] }}
+                        </a>
+                    </dd>
+                </div>
+                {% endif %}
+            </dl>
+            <div class="mt-3 pt-3 border-t border-slate-100 text-xs space-y-1">
+                <a href="{{ url_for('sf.record_view_raw', object_name=obj.name, record_id=record.Id) }}"
+                   class="text-slate-500 hover:text-slate-700 hover:underline block">
+                    → full raw view
+                </a>
+                <a href="{{ url_for('sf.migrate_object', object_name=obj.name) }}"
+                   class="text-slate-500 hover:text-slate-700 hover:underline block">
+                    → Migration report
+                </a>
+            </div>
+        </section>
+
+        {# Files — attached binaries (PDFs, images, docs) downloaded via
+           scripts/download_files.py. Missing binaries still show up with a
+           grayed-out "not downloaded" badge so the user knows they exist. #}
+        {% if record_files %}
+        <details class="kb-section bg-white rounded-lg shadow-sm border border-slate-200 group" open>
+            <summary class="text-sm font-semibold text-slate-700 px-3 py-2 border-b border-slate-200 bg-slate-50 rounded-t-lg cursor-pointer list-none flex items-center justify-between hover:bg-slate-100">
+                <span>
+                    <span class="chevron text-slate-400">▸</span>
+                    Files
+                    <span class="text-slate-400 font-normal text-xs ml-1">({{ record_files|length }})</span>
+                </span>
+            </summary>
+            <ul class="divide-y divide-slate-100">
+                {% for f in record_files %}
+                <li class="px-3 py-2 text-xs">
+                    <div class="flex items-start gap-2">
+                        <span class="shrink-0 mt-0.5 w-4 text-center text-sm">
+                            {% set ext = f.name.rsplit('.', 1)[-1]|lower if '.' in f.name else '' %}
+                            {% if ext == 'pdf' %}📄
+                            {% elif ext in ('png', 'jpg', 'jpeg', 'gif', 'webp', 'svg') %}🖼️
+                            {% elif ext in ('xlsx', 'xls', 'csv') %}📊
+                            {% elif ext in ('doc', 'docx') %}📝
+                            {% elif ext in ('zip', 'tar', 'gz') %}🗜️
+                            {% else %}📎
+                            {% endif %}
+                        </span>
+                        <div class="flex-1 min-w-0">
+                            {% if f.missing %}
+                            <span class="text-slate-400 line-through truncate block" title="{{ f.name }}">
+                                {{ f.name }}
+                            </span>
+                            {% else %}
+                            <a class="text-blue-700 hover:underline font-medium truncate block"
+                               href="{{ url_for('sf.serve_file', file_id=f.id) }}"
+                               target="_blank"
+                               rel="noopener"
+                               title="{{ f.name }}">
+                                {{ f.name }}
+                            </a>
+                            {% endif %}
+                            <div class="mt-0.5 flex flex-wrap items-center gap-x-1.5 gap-y-0.5 text-[10px] text-slate-500">
+                                {% if f.size %}
+                                <span>
+                                    {% if f.size > 1024*1024 %}{{ "%.1f"|format(f.size/1024/1024) }} MB
+                                    {% elif f.size > 1024 %}{{ "%.1f"|format(f.size/1024) }} KB
+                                    {% else %}{{ f.size }} B
+                                    {% endif %}
+                                </span>
+                                {% endif %}
+                                {% if f.created_date %}
+                                <span class="text-slate-300">·</span>
+                                <span>{{ f.created_date[:10] }}</span>
+                                {% endif %}
+                                <span class="text-slate-300">·</span>
+                                <span class="text-slate-400">{{ f.source_object }}</span>
+                                {% if f.missing %}
+                                <span class="inline-block text-[9px] font-medium px-1 py-0.5 rounded
+                                             bg-amber-50 text-amber-700 border border-amber-200"
+                                      title="Run `make files` to download this binary">
+                                    not downloaded
+                                </span>
+                                {% endif %}
+                            </div>
+                        </div>
+                    </div>
+                </li>
+                {% endfor %}
+            </ul>
+        </details>
+        {% endif %}
+
+        {# Activity timeline — unified Task/Event/EmailMessage stream.
+           Sits in the right sidebar, mimicking Salesforce Lightning's Activity panel.
+           Scrolls internally so it doesn't dominate the page. #}
+        {% if activity_timeline and activity_timeline.total %}
+        <details class="kb-section bg-white rounded-lg shadow-sm border border-slate-200 group" open>
+            <summary class="text-sm font-semibold text-slate-700 px-3 py-2 border-b border-slate-200 bg-slate-50 rounded-t-lg cursor-pointer list-none flex items-center justify-between hover:bg-slate-100">
+                <span>
+                    <span class="chevron text-slate-400">▸</span>
+                    Activity
+                    <span class="text-slate-400 font-normal text-xs ml-1">
+                        ({{ activity_timeline.total }}{% if activity_timeline.overflow %} of {{ activity_timeline.total_matches }}{% endif %})
+                    </span>
+                </span>
+            </summary>
+            <div class="max-h-[70vh] overflow-y-auto">
+                {% for group in activity_timeline.groups %}
+                {% if group['items'] %}
+                <div class="px-3 py-1 bg-slate-50 border-b border-slate-100
+                            text-[10px] uppercase tracking-wide text-slate-500 font-medium sticky top-0">
+                    {{ group.title }}
+                    <span class="text-slate-400 font-normal normal-case tracking-normal ml-1">
+                        · {{ group['items']|length }}
+                    </span>
+                </div>
+                <ul class="divide-y divide-slate-100">
+                    {% for item in group['items'] %}
+                    <li class="px-3 py-2 hover:bg-slate-50 text-xs">
+                        <div class="flex items-start gap-2">
+                            <span class="shrink-0 mt-0.5 w-4 text-center text-sm leading-none"
+                                  title="{{ item.type }}">
+                                {% if item.type == 'task' %}
+                                    {% if item.is_gong %}🎧{% else %}📞{% endif %}
+                                {% elif item.type == 'event' %}
+                                    📅
+                                {% elif item.type == 'email' %}
+                                    ✉️
+                                {% else %}
+                                    •
+                                {% endif %}
+                            </span>
+                            <div class="flex-1 min-w-0">
+                                <a class="text-blue-700 hover:underline font-medium block truncate"
+                                   href="{{ url_for('sf.record_view',
+                                               object_name=(item.type == 'task' and 'Task'
+                                                            or (item.type == 'event' and 'Event'
+                                                                or 'EmailMessage')),
+                                               record_id=item.id) }}"
+                                   title="{{ item.subject }}">
+                                    {{ item.subject }}
+                                </a>
+                                <div class="mt-0.5 flex flex-wrap items-center gap-x-1.5 gap-y-0.5 text-[10px] text-slate-500">
+                                    <span class="tabular-nums">{{ item.date or '–' }}</span>
+                                    {% if item.owner_name and item.owner_id %}
+                                    <span class="text-slate-300">·</span>
+                                    <a class="text-blue-700 hover:underline truncate max-w-[120px]"
+                                       href="{{ url_for('sf.record_view', object_name='User', record_id=item.owner_id) }}">
+                                        {{ item.owner_name }}
+                                    </a>
+                                    {% endif %}
+                                    {% if item.is_gong %}
+                                    <span class="inline-block text-[9px] font-mono px-1 py-0.5 rounded
+                                        {% if item.gong_direction == 'in' %}bg-emerald-50 text-emerald-700 border border-emerald-200
+                                        {% elif item.gong_direction == 'out' %}bg-blue-50 text-blue-700 border border-blue-200
+                                        {% else %}bg-slate-100 text-slate-600 border border-slate-200{% endif %}">
+                                        {% if item.gong_direction == 'in' %}Gong In
+                                        {% elif item.gong_direction == 'out' %}Gong Out
+                                        {% else %}Gong{% endif %}
+                                    </span>
+                                    {% endif %}
+                                    {% if item.status and item.type == 'task' and item.status|lower not in ('completed', 'closed', 'done') %}
+                                    <span class="inline-block text-[9px] px-1 py-0.5 rounded
+                                                 bg-amber-50 text-amber-700 border border-amber-200">
+                                        {{ item.status }}
+                                    </span>
+                                    {% endif %}
+                                </div>
+                            </div>
+                        </div>
+                    </li>
+                    {% endfor %}
+                </ul>
+                {% endif %}
+                {% endfor %}
+                {% if activity_timeline.overflow %}
+                <div class="px-3 py-2 text-[10px] text-slate-500 bg-slate-50 border-t border-slate-100">
+                    Showing first {{ activity_timeline.total }} of
+                    {{ activity_timeline.total_matches }} — see Related.
+                </div>
+                {% endif %}
+            </div>
+        </details>
+        {% endif %}
+
+        {# Migration hint — tiny, unobtrusive, reminds the user of the project goal #}
+        <section class="bg-emerald-50 border border-emerald-200 rounded-lg p-3">
+            <div class="text-[11px] uppercase tracking-wide text-emerald-700 mb-1">Migration</div>
+            <p class="text-xs text-emerald-900">
+                This is {{ record.Id }} in <code>{{ obj.name }}</code>. When exporting
+                to a new system, map the sections shown here to your target schema.
+                Use the raw view to confirm every field is covered.
+            </p>
+        </section>
+    </aside>
+</div>
+
+<script>
+    (function () {
+        const expandBtn = document.getElementById('foldExpandAll');
+        const collapseBtn = document.getElementById('foldCollapseAll');
+        if (!expandBtn || !collapseBtn) return;
+        function setAll(open) {
+            document.querySelectorAll('details.kb-section').forEach(d => {
+                if (open) d.setAttribute('open', '');
+                else d.removeAttribute('open');
+            });
+        }
+        expandBtn.addEventListener('click', () => setAll(true));
+        collapseBtn.addEventListener('click', () => setAll(false));
+    })();
+</script>
+{% endblock %}

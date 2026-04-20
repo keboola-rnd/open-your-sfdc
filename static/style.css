@@ -1,0 +1,29 @@
+/* Minimal custom styles; Tailwind CDN handles the rest. */
+body { min-height: 100vh; }
+code { background: #f1f5f9; padding: 1px 4px; border-radius: 3px; font-size: 0.85em; }
+table.min-w-full { border-collapse: collapse; }
+
+/* Search snippet highlighting */
+.search-snippet mark {
+    background: #fef08a;
+    color: #854d0e;
+    padding: 0 2px;
+    border-radius: 2px;
+    font-weight: 600;
+}
+
+/* Foldable section chevron — rotates when <details> is open. */
+details .chevron {
+    display: inline-block;
+    width: 0.75rem;
+    transition: transform 0.15s ease-out;
+}
+details[open] .chevron {
+    transform: rotate(90deg);
+}
+
+/* Auto-hide empty fields: toggled by checkbox in header (body class).
+   The `auto-hide-empty-early` class on <html> is set by an inline script
+   before first paint to avoid flash-of-empty-fields on page load. */
+body.auto-hide-empty .kb-field-empty,
+html.auto-hide-empty-early .kb-field-empty { display: none; }

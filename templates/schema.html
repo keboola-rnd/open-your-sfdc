@@ -1,0 +1,88 @@
+{% extends "base.html" %}
+{% block title %}{{ obj.name }} - Schema{% endblock %}
+
+{% block content %}
+<div class="mb-4">
+    <div class="text-xs text-slate-500">
+        <a href="{{ url_for('sf.dashboard') }}">Objects</a> /
+        <a href="{{ url_for('sf.table_view', object_name=obj.name) }}">{{ obj.label }}</a> /
+        schema
+    </div>
+    <h1 class="text-2xl font-bold font-mono">{{ obj.name }}</h1>
+    <div class="text-sm text-slate-500">
+        {{ obj.label }} &middot;
+        {{ "{:,}".format(obj.record_count or 0) }} records &middot;
+        {{ fields|length }} fields
+        {% if obj.custom %}&middot; <span class="text-amber-600">custom object</span>{% endif %}
+    </div>
+</div>
+
+<section class="bg-white rounded shadow p-4 mb-6">
+    <h2 class="text-sm uppercase text-slate-500 mb-3">Fields</h2>
+    <table class="min-w-full text-sm">
+        <thead>
+            <tr class="text-left border-b text-slate-600">
+                <th class="py-1 pr-4">Name</th>
+                <th class="py-1 pr-4">Label</th>
+                <th class="py-1 pr-4">SF Type</th>
+                <th class="py-1 pr-4">SQLite Type</th>
+                <th class="py-1 pr-4">Length</th>
+                <th class="py-1 pr-4">References</th>
+                <th class="py-1 pr-4">Flags</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for f in fields %}
+            <tr class="border-b hover:bg-slate-50">
+                <td class="py-1 pr-4 font-mono text-xs">{{ f.field_name }}</td>
+                <td class="py-1 pr-4">{{ f.label or '' }}</td>
+                <td class="py-1 pr-4"><span class="bg-slate-100 rounded px-2 py-0.5 text-xs">{{ f.sf_type }}</span></td>
+                <td class="py-1 pr-4 text-xs text-slate-500">{{ f.sqlite_type }}</td>
+                <td class="py-1 pr-4 text-xs">{{ f.length or '' }}</td>
+                <td class="py-1 pr-4 text-xs">
+                    {% if f.reference_to %}
+                        {% for ref in f.reference_to.split(',') %}
+                            <a class="text-blue-600 hover:underline font-mono" href="{{ url_for('sf.schema_view', object_name=ref) }}">{{ ref }}</a>{% if not loop.last %}, {% endif %}
+                        {% endfor %}
+                    {% endif %}
+                </td>
+                <td class="py-1 pr-4 text-xs space-x-1">
+                    {% if f.custom %}<span class="bg-amber-100 text-amber-800 rounded px-1.5 py-0.5">custom</span>{% endif %}
+                    {% if not f.nillable %}<span class="bg-red-100 text-red-800 rounded px-1.5 py-0.5">required</span>{% endif %}
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</section>
+
+<section class="grid grid-cols-1 md:grid-cols-2 gap-4">
+    <div class="bg-white rounded shadow p-4">
+        <h2 class="text-sm uppercase text-slate-500 mb-2">Inbound references (children)</h2>
+        {% if inbound %}
+        <ul class="text-sm space-y-1">
+            {% for rel in inbound %}
+            <li>
+                <a class="text-blue-700 hover:underline font-mono" href="{{ url_for('sf.schema_view', object_name=rel.from_object) }}">{{ rel.from_object }}</a>
+                <span class="text-slate-500">.{{ rel.from_field }}</span>
+            </li>
+            {% endfor %}
+        </ul>
+        {% else %}<div class="text-slate-500 text-sm">None.</div>{% endif %}
+    </div>
+    <div class="bg-white rounded shadow p-4">
+        <h2 class="text-sm uppercase text-slate-500 mb-2">Outbound references (lookups)</h2>
+        {% if outbound %}
+        <ul class="text-sm space-y-1">
+            {% for rel in outbound %}
+            <li>
+                <span class="font-mono">{{ rel.from_field }}</span>
+                <span class="text-slate-500">&rarr;</span>
+                <a class="text-blue-700 hover:underline font-mono" href="{{ url_for('sf.schema_view', object_name=rel.to_object) }}">{{ rel.to_object }}</a>
+            </li>
+            {% endfor %}
+        </ul>
+        {% else %}<div class="text-slate-500 text-sm">None.</div>{% endif %}
+    </div>
+</section>
+{% endblock %}
