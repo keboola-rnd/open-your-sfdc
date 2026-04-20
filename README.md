@@ -101,17 +101,36 @@ git clone https://github.com/keboola-rnd/open-your-sfdc && cd open-your-sfdc
 make install
 cp .env.example .env   # fill in SF credentials
 
+# Option A — one command, everything at once (records + binaries + metadata):
+make archive
+
+# Option B — step by step if you want to watch each phase:
 make refresh           # export to CSV + import to SQLite (~5-30 minutes)
 make files             # download binaries (can take hours for big orgs)
 make files-gaps        # fetch SDocs PDFs + chatter attachments the default
                        # scan skipped (permissions, external refs, etc.)
+make metadata          # Flow / ValidationRule / Workflow / LWC via Tooling API
+make sfdx-retrieve     # Layouts, Profiles, CustomLabels as XML (needs sf CLI — see below)
+make event-logs        # EventLogFile binaries (needs Event Monitoring licence)
 
 make browser           # http://localhost:5003
 ```
 
-All outputs land under `data/` which is gitignored. After `make refresh`
+All outputs land under `data/` which is gitignored. After `make archive`
 you are done with Salesforce — the rest of the workflow runs on your
-laptop, against your file.
+laptop, against your files.
+
+### One command, whole org
+
+```bash
+make archive           # data + binaries + metadata + SFDX + event logs + audit
+make archive-audit     # re-run just the audit to see what's complete
+```
+
+`make archive` is idempotent — re-running it refreshes records and metadata,
+keeps already-downloaded binaries (via `--resume`), and ends with an audit
+listing any gaps. Run it daily during an off-boarding window, or once and
+back up the `data/` tree.
 
 ## Architecture
 
@@ -119,8 +138,14 @@ laptop, against your file.
 Salesforce org
       │
       │  scripts/export_all.py         (describe + query_all / bulk API)
+      │  scripts/export_metadata.py    (Tooling API: Flow / Validation / LWC)
+      │  scripts/download_event_logs.py (EventLogFile binaries)
+      │  scripts/sfdx_retrieve.sh      (Metadata API: Layouts / Profiles XML)
       ▼
 data/sf_full_export/*.csv + metadata.json
+data/sf_metadata/<Type>/<Name>.json    (Flow / ValidationRule / Workflow / LWC)
+data/sf_sfdx_metadata/main/default/... (Layouts, Profiles, full XML)
+data/sf_event_logs/<date>/<type>.csv   (hourly audit stream)
       │
       │  scripts/import_to_sqlite.py   (auto-schema, indexes, FTS5)
       ▼
@@ -139,8 +164,11 @@ Run `make help` for the full menu. Highlights:
 
 | Target | Script | Purpose |
 |---|---|---|
+| **`make archive`** | umbrella | **One shot: data + binaries + metadata + SFDX + event logs + audit** |
+| `make archive-audit` | `scripts/audit_archive.py` | Verify the archive is whole, list what's missing |
 | `make export` | `scripts/export_all.py` | Dump every SObject to CSV |
-| `make export-dry` | `scripts/export_all.py --dry-run` | Show what would run |
+| `make export-dry` | `… --dry-run` | Show what would run |
+| `make export-history` | `… --include-history` | Include `*__History` tables (can be huge) |
 | `make import` | `scripts/import_to_sqlite.py` | CSV → SQLite (drops + rebuilds) |
 | `make refresh` | both | Export + import in one go |
 | `make describe` | `scripts/fetch_descriptions.py` | Adds human object descriptions |
@@ -148,8 +176,66 @@ Run `make help` for the full menu. Highlights:
 | `make files-dry` | `… --dry-run` | What would be downloaded |
 | `make files-audit` | `scripts/audit_files.py` | Compare DB vs disk vs external refs |
 | `make files-gaps` | `… --type external --resume` | SDocs PDFs + chatter refs |
+| `make metadata` | `scripts/export_metadata.py` | Flow / ValidationRule / Workflow / LWC / CustomField via Tooling API |
+| `make metadata-dry` | `… --dry-run` | Counts only, no writes |
+| `make sfdx-check` | | Verify `sf` CLI installed + authenticated |
+| `make sfdx-retrieve` | `scripts/sfdx_retrieve.sh` | Layouts / Profiles / CustomLabels as XML |
+| `make event-logs` | `scripts/download_event_logs.py` | Event Monitoring hourly logs (needs licence) |
+| `make event-logs-dry` | `… --dry-run` | What would be downloaded |
 | `make browser` | `run.py` | Start the reference web UI on port 5003 |
 | `make browser-stop` | | Kill anything listening on 5003 |
+
+## What ends up on disk after `make archive`
+
+```
+data/
+├── sf_full_export/               every SObject as CSV + metadata.json
+│   ├── Account.csv               (including ApexClass.csv with full Body,
+│   ├── Opportunity.csv            ApexTrigger, ApexPage, Aura, SetupAuditTrail)
+│   ├── metadata.json             field-level schema for every object
+│   └── _export_log.json          durations, errors, API-call counter
+│
+├── salesforce_full.db            the typed SQLite DB — this is the thing
+│                                 you hand to Claude Code / agents
+│
+├── sf_files/                     binaries referenced by records
+│   ├── ContentVersion/
+│   ├── Attachment/
+│   ├── Document/                  (classic Documents)
+│   └── manifest.json              Id → local path mapping
+│
+├── sf_metadata/                  what Tooling API gives us (JSON)
+│   ├── Flow/<Name>__v<N>.json    every Flow version, full metadata body
+│   ├── FlowDefinition/*.json     active-version pointers
+│   ├── ValidationRule/*.json
+│   ├── WorkflowRule/*.json
+│   ├── WorkflowFieldUpdate/*.json
+│   ├── WorkflowTask/*.json
+│   ├── WorkflowOutboundMessage/*.json
+│   ├── LightningComponentBundle/<Name>/    bundle JSON + raw source files
+│   ├── CustomField/*.json        formulas, defaults, picklist sources
+│   ├── InstalledSubscriberPackage.json
+│   ├── CronTrigger.json
+│   └── _index.json
+│
+├── sf_sfdx_metadata/             XML-style metadata from Metadata API
+│   └── main/default/
+│       ├── layouts/*.layout-meta.xml
+│       ├── profiles/*.profile-meta.xml
+│       ├── flows/*.flow-meta.xml         (same flows as above, in XML)
+│       ├── labels/*.labels-meta.xml
+│       ├── objects/<Name>/                full CustomObject XML
+│       └── ... (every type in config/sfdx_package.xml)
+│
+└── sf_event_logs/                hourly audit logs (needs licence)
+    ├── <YYYY-MM-DD>/<EventType>_<Interval>_<Sequence>.csv
+    └── manifest.json
+```
+
+The overlap between `sf_metadata/Flow/*.json` (from Tooling API) and
+`sf_sfdx_metadata/main/default/flows/*.flow-meta.xml` (from Metadata API)
+is deliberate: one is convenient for greppable reading, the other is
+deployable back into a new org if you ever need it.
 
 ## Keboola view vs Raw view (both are just reference views)
 
@@ -192,6 +278,15 @@ exist.
 Designed for the inevitable *"OK we're moving to a real database — which
 fields do we actually need?"* conversation, which is also the conversation
 that tends to happen right before *"and can an agent do this for us?"*
+
+## Further documentation
+
+- [`docs/backup-guide.md`](docs/backup-guide.md) — operational reference
+  for scheduled backups, resume semantics, pre-shutdown checklist, and
+  troubleshooting. Read this before running `make archive` against a
+  large org for the first time.
+- [`docs/architecture.md`](docs/architecture.md) — design of the export
+  and import pipelines.
 
 ## The philosophy
 

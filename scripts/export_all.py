@@ -14,6 +14,8 @@ Usage:
     python scripts/export_all.py --custom-only       # Only custom objects
     python scripts/export_all.py --resume            # Skip already exported
     python scripts/export_all.py --include-deleted   # Include soft-deleted
+    python scripts/export_all.py --include-history   # Include *__History objects
+                                                     # (field history — can be huge)
 
 Requires .env with Salesforce credentials (see sf_connect.py).
 """
@@ -51,23 +53,32 @@ except ImportError:
 
 EXPORT_DIR = DATA_DIR / "sf_full_export"
 
-# Suffix patterns for system/auto-generated objects we never want to export.
-SKIP_SUFFIXES = (
-    "__History",
+# Suffix patterns for system/auto-generated objects we always skip — these
+# are never useful (Chatter feeds, record sharing, CDC streams, tags).
+PERMANENT_SKIP_SUFFIXES = (
     "__Feed",
     "__Share",
     "__Tag",
     "__ChangeEvent",
 )
 
+# Suffix patterns that are skipped by default but can be re-enabled with
+# ``--include-history``. Field history tables are often huge (millions of
+# rows for big orgs) and keep 18 months of retention without Shield.
+OPTIONAL_SKIP_SUFFIXES = (
+    "__History",
+)
+
 # Hard-coded skip list for objects that are known to fail or return useless data.
+# NOTE: ``SetupAuditTrail`` is NOT here — we always want it (180-day retention
+# of "who changed what in Setup"). EventLogFile stays because its binaries
+# need a separate endpoint; see scripts/download_event_logs.py.
 SKIP_OBJECTS = {
     "IdeaComment",
     "Vote",
     "ContentBody",
     "EventLogFile",
     "ApexLog",
-    "SetupAuditTrail",
     # Extra noisy or unqueryable-in-practice system objects:
     "LoginHistory",
     "AuthSession",
@@ -110,7 +121,7 @@ def utc_now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def is_exportable(obj: dict) -> bool:
+def is_exportable(obj: dict, *, include_history: bool = False) -> bool:
     """Return True if the SObject describe entry represents something we want to export."""
     name = obj.get("name", "")
     if not obj.get("queryable"):
@@ -119,21 +130,26 @@ def is_exportable(obj: dict) -> bool:
         return False
     if name in SKIP_OBJECTS:
         return False
-    if any(name.endswith(suffix) for suffix in SKIP_SUFFIXES):
+    if any(name.endswith(suffix) for suffix in PERMANENT_SKIP_SUFFIXES):
+        return False
+    if not include_history and any(
+        name.endswith(suffix) for suffix in OPTIONAL_SKIP_SUFFIXES
+    ):
         return False
     return True
 
 
-def discover_objects(sf: Salesforce) -> list[dict]:
+def discover_objects(sf: Salesforce, *, include_history: bool = False) -> list[dict]:
     """Return the list of sobject describe entries we plan to export."""
     print("\nDiscovering objects via sf.describe()...")
     global_desc = sf.describe()
     sobjects = global_desc["sobjects"]
-    exportable = [o for o in sobjects if is_exportable(o)]
+    exportable = [o for o in sobjects if is_exportable(o, include_history=include_history)]
     exportable.sort(key=lambda o: o["name"])
+    history_note = " (+ __History)" if include_history else ""
     print(
         f"  Found {len(sobjects)} sobjects total, "
-        f"{len(exportable)} exportable after filtering."
+        f"{len(exportable)} exportable after filtering{history_note}."
     )
     return exportable
 
@@ -479,6 +495,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Include soft-deleted records (REST query_all only).",
     )
     parser.add_argument(
+        "--include-history",
+        action="store_true",
+        help="Include *__History field-history objects (can add millions of rows).",
+    )
+    parser.add_argument(
         "--sleep",
         type=float,
         default=0.5,
@@ -515,7 +536,7 @@ def main(argv: list[str] | None = None) -> int:
 
     EXPORT_DIR.mkdir(parents=True, exist_ok=True)
 
-    all_objects = discover_objects(sf)
+    all_objects = discover_objects(sf, include_history=args.include_history)
     only_names = args.objects.split(",") if args.objects else None
     selected = filter_objects(
         all_objects,
