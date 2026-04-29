@@ -116,6 +116,34 @@ BULK_THRESHOLD = 50_000
 # lists by this when an object has unusually many fields.
 SOQL_QUERY_CHAR_LIMIT = 18_000
 
+# Objects whose REST query refuses to run without a WHERE filter on a parent
+# ID (Salesforce platform restriction, not a bug). We work around it with
+# chunked queries: load parent IDs from the parent CSV (or fetch via API as a
+# fallback) and run ``SELECT ... WHERE <filter_field> IN (chunk)``.
+#
+# ContentFolderMember is special: SF only accepts ``=`` here, not ``IN`` —
+# hence chunk_size=1 (yields one query per parent folder).
+#
+# Alphabetical iteration in discover_objects() guarantees the parent runs
+# first for the default full-export case (ContentDocument < ContentDocumentLink,
+# ContentFolder < ContentFolderItem/Member). For ad-hoc --objects runs the
+# helper falls back to a live ``SELECT Id FROM <parent>`` query.
+#
+# Format: child_object -> (parent_object, filter_field, parent_id_column, chunk_size).
+FILTER_REQUIRED_OBJECTS: dict[str, tuple[str, str, str, int]] = {
+    "ContentDocumentLink": ("ContentDocument", "ContentDocumentId", "Id", 200),
+    "ContentFolderItem": ("ContentFolder", "ParentContentFolderId", "Id", 200),
+    "ContentFolderMember": ("ContentFolder", "ParentContentFolderId", "Id", 1),
+}
+
+# Objects the Bulk API rejects with "InvalidEntity" (typically polymorphic
+# junction tables tying Event/Task to Lead/Contact/User). Force REST
+# query_all regardless of record count.
+FORCE_REST_OBJECTS: set[str] = {
+    "EventWhoRelation",
+    "TaskWhoRelation",
+}
+
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -242,6 +270,78 @@ def query_all_bulk(
     return list(bulk_handle.query_all(soql))
 
 
+def get_parent_ids(
+    sf: Salesforce,
+    parent_object: str,
+    parent_csv: Path,
+    parent_id_column: str = "Id",
+) -> list[str]:
+    """Return parent IDs for a chunked child query.
+
+    Reads from the local parent CSV when present (the common case during a
+    full export, since alphabetical order means the parent ran first). Falls
+    back to ``SELECT Id FROM <parent_object>`` when the CSV is missing — this
+    matters for ad-hoc ``--objects ContentDocumentLink`` runs.
+    """
+    if parent_csv.exists() and parent_csv.stat().st_size > 0:
+        ids: list[str] = []
+        with open(parent_csv, "r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                pid = row.get(parent_id_column)
+                if pid:
+                    ids.append(pid)
+        return ids
+
+    print(
+        f"    parent CSV {parent_csv.name} missing -> "
+        f"querying {parent_object}.{parent_id_column} from API"
+    )
+    result = sf.query_all(f"SELECT {parent_id_column} FROM {parent_object}")
+    return [rec[parent_id_column] for rec in result["records"] if rec.get(parent_id_column)]
+
+
+def query_chunked_by_parent_ids(
+    sf: Salesforce,
+    object_name: str,
+    fields: list[str],
+    filter_field: str,
+    parent_ids: list[str],
+    chunk_size: int,
+) -> list[dict]:
+    """Fetch records that require a parent-ID filter, one chunk at a time.
+
+    Uses ``WHERE filter_field IN (chunk)`` for chunk_size > 1 and
+    ``WHERE filter_field = 'id'`` for chunk_size == 1 (some objects, notably
+    ContentFolderMember, only accept the equals operator).
+    """
+    if not parent_ids:
+        return []
+
+    field_clause = ", ".join(fields)
+    merged: dict[str, dict] = {}
+    total_chunks = (len(parent_ids) + chunk_size - 1) // chunk_size
+
+    for idx, start in enumerate(range(0, len(parent_ids), chunk_size), start=1):
+        chunk = parent_ids[start:start + chunk_size]
+        if len(chunk) == 1:
+            where = f"{filter_field} = '{chunk[0]}'"
+        else:
+            ids_quoted = ", ".join(f"'{pid}'" for pid in chunk)
+            where = f"{filter_field} IN ({ids_quoted})"
+        soql = f"SELECT {field_clause} FROM {object_name} WHERE {where}"
+        result = sf.query_all(soql)
+        for rec in result["records"]:
+            rid = rec.get("Id")
+            if rid:
+                merged[rid] = rec
+        # Light progress logging for runs with many chunks.
+        if total_chunks >= 10 and idx % 10 == 0:
+            print(f"    chunk {idx}/{total_chunks} -> {len(merged):,} unique records so far")
+
+    return list(merged.values())
+
+
 def write_csv(records: list[dict], path: Path, fields: list[str]) -> int:
     """Write records to CSV. Columns follow the provided field list order."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -351,20 +451,48 @@ def export_object(
         if not field_names:
             raise RuntimeError("no selectable fields")
 
-        total = count_records(sf, object_name)
-        result["record_count_pre"] = total
-
-        if total is not None and total >= BULK_THRESHOLD:
-            print(f"  {object_name}: {total:,} records -> using bulk API")
-            records = query_all_bulk(sf, object_name, field_names)
-            result["method"] = "bulk"
-        else:
-            count_display = f"{total:,}" if total is not None else "unknown"
-            print(f"  {object_name}: {count_display} records -> using REST query_all")
-            records = query_all_standard(
-                sf, object_name, field_names, include_deleted=include_deleted
+        if object_name in FILTER_REQUIRED_OBJECTS:
+            # Filter-required objects refuse SELECT without WHERE — chunked
+            # query against the parent's IDs is the only way to get a full
+            # dump. count_records() also fails for these, so we skip it.
+            parent_object, filter_field, parent_id_column, chunk_size = (
+                FILTER_REQUIRED_OBJECTS[object_name]
             )
-            result["method"] = "rest"
+            parent_csv_path = export_dir / f"{parent_object}.csv"
+            parent_ids = get_parent_ids(
+                sf, parent_object, parent_csv_path, parent_id_column
+            )
+            print(
+                f"  {object_name}: chunked query via {filter_field} "
+                f"over {len(parent_ids):,} {parent_object} parent IDs "
+                f"(chunk_size={chunk_size})"
+            )
+            records = query_chunked_by_parent_ids(
+                sf, object_name, field_names, filter_field, parent_ids, chunk_size,
+            )
+            result["method"] = "rest-chunked"
+            result["record_count_pre"] = len(parent_ids)
+        else:
+            total = count_records(sf, object_name)
+            result["record_count_pre"] = total
+
+            if object_name in FORCE_REST_OBJECTS:
+                print(f"  {object_name}: forced REST query_all (Bulk API rejects this entity)")
+                records = query_all_standard(
+                    sf, object_name, field_names, include_deleted=include_deleted
+                )
+                result["method"] = "rest-forced"
+            elif total is not None and total >= BULK_THRESHOLD:
+                print(f"  {object_name}: {total:,} records -> using bulk API")
+                records = query_all_bulk(sf, object_name, field_names)
+                result["method"] = "bulk"
+            else:
+                count_display = f"{total:,}" if total is not None else "unknown"
+                print(f"  {object_name}: {count_display} records -> using REST query_all")
+                records = query_all_standard(
+                    sf, object_name, field_names, include_deleted=include_deleted
+                )
+                result["method"] = "rest"
 
         written = write_csv(records, csv_path, field_names)
         result["records"] = written

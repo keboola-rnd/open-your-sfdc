@@ -1,4 +1,4 @@
-.PHONY: help install export export-dry export-history import refresh files files-force files-dry files-audit files-gaps describe metadata metadata-dry sfdx-check sfdx-retrieve event-logs event-logs-dry archive archive-audit browser browser-stop
+.PHONY: help install export export-dry export-history rebuild-metadata import refresh files files-force files-dry files-audit files-gaps describe metadata metadata-dry sfdx-check sfdx-retrieve event-logs event-logs-dry archive archive-audit browser browser-stop
 
 help: ## Show this help
 	@awk 'BEGIN {FS = ":.*?## "} \
@@ -27,6 +27,9 @@ import: ## Drop + rebuild SQLite DB from CSV (data/salesforce_full.db)
 	.venv/bin/python scripts/import_to_sqlite.py
 
 refresh: export import ## Full refresh: export + import (~50 min for a mid-size org)
+
+rebuild-metadata: ## Rebuild metadata.json + _export_log.json from existing CSVs (no data re-fetch)
+	.venv/bin/python scripts/rebuild_metadata.py
 
 describe: ## Fetch object descriptions from SF and add to _sf_objects table
 	.venv/bin/python scripts/fetch_descriptions.py
