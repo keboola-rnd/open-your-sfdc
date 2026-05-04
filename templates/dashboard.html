@@ -38,6 +38,61 @@
     </div>
 </section>
 
+{# ── History & audit objects (collapsed by default) ── #}
+{% if history_objects %}
+<section class="bg-white rounded-lg shadow p-4 mb-6">
+    <button onclick="document.getElementById('history-objects').classList.toggle('hidden'); this.querySelector('#history-toggle-label').textContent = document.getElementById('history-objects').classList.contains('hidden') ? 'show' : 'hide'"
+            class="text-left w-full flex items-center justify-between text-slate-700 hover:text-slate-900 cursor-pointer">
+        <h2 class="text-lg font-semibold">
+            History &amp; audit
+            <span class="text-sm font-normal text-slate-400">({{ history_objects|length }} · {{ "{:,}".format(history_total_records) }} rows)</span>
+        </h2>
+        <span class="text-xs text-slate-500">
+            field-change tracking, audit trails &middot; <span id="history-toggle-label">show</span>
+        </span>
+    </button>
+    <table id="history-objects" class="hidden min-w-full text-sm mt-3">
+        <thead>
+            <tr class="text-left text-slate-600 border-b">
+                <th class="py-2 pr-4">Name</th>
+                <th class="py-2 pr-4">Tracks changes on</th>
+                <th class="py-2 pr-4 text-right">Records</th>
+                <th class="py-2 pr-4">Type</th>
+                <th class="py-2 pr-4">Actions</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for o in history_objects %}
+            <tr class="border-b hover:bg-slate-50 object-row" data-name="{{ o.name | lower }}">
+                <td class="py-2 pr-4">
+                    <a class="text-blue-700 hover:underline font-mono" href="{{ url_for('sf.table_view', object_name=o.name) }}">{{ o.name }}</a>
+                </td>
+                <td class="py-2 pr-4 text-slate-600">
+                    {% if o.tracks_object %}
+                        <a class="text-slate-700 hover:underline font-mono text-xs" href="{{ url_for('sf.table_view', object_name=o.tracks_object) }}">{{ o.tracks_object }}</a>
+                    {% else %}
+                        <span class="text-slate-400 text-xs">{{ o.label }}</span>
+                    {% endif %}
+                </td>
+                <td class="py-2 pr-4 text-right font-mono">{{ "{:,}".format(o.record_count or 0) }}</td>
+                <td class="py-2 pr-4">
+                    {% if o.custom %}
+                        <span class="bg-amber-100 text-amber-800 text-xs px-2 py-0.5 rounded">custom</span>
+                    {% else %}
+                        <span class="bg-slate-100 text-slate-700 text-xs px-2 py-0.5 rounded">standard</span>
+                    {% endif %}
+                </td>
+                <td class="py-2 pr-4 space-x-3">
+                    <a class="text-blue-600 hover:underline text-xs" href="{{ url_for('sf.table_view', object_name=o.name) }}">data</a>
+                    <a class="text-blue-600 hover:underline text-xs" href="{{ url_for('sf.schema_view', object_name=o.name) }}">schema</a>
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</section>
+{% endif %}
+
 {# ── All objects with data ── #}
 <section class="bg-white rounded-lg shadow p-4 mb-6">
     <div class="flex items-center justify-between mb-4 gap-4">

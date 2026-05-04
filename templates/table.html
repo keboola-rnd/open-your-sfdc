@@ -19,6 +19,10 @@
             {{ obj.label }}
             &middot; {{ "{:,}".format(total) }} records matching filter
             &middot; {{ "{:,}".format(obj.record_count or 0) }} total
+            {% if has_deleted_col and deleted_count and not show_deleted %}
+            &middot;
+            <span class="text-rose-600">{{ "{:,}".format(deleted_count) }} deleted hidden</span>
+            {% endif %}
         </div>
         {% if obj_description %}
         <div class="text-xs text-slate-400 mt-0.5">{{ obj_description }}</div>
@@ -99,6 +103,23 @@
             <option value="{{ ps }}" {% if page_size == ps %}selected{% endif %}>{{ ps }}</option>
             {% endfor %}
         </select>
+
+        {% if has_deleted_col %}
+        <label class="flex items-center gap-1 text-xs text-slate-600 ml-3 cursor-pointer"
+               title="Soft-deleted records were captured by `make export-shutdown` (REST queryAll).">
+            <input type="checkbox" name="show_deleted" value="1"
+                   {% if show_deleted %}checked{% endif %}
+                   onchange="this.form.submit()"
+                   class="cursor-pointer">
+            Show deleted
+            {% if deleted_count %}
+                <span class="bg-rose-50 text-rose-700 border border-rose-200 px-1 rounded text-[10px] font-mono">
+                    {{ "{:,}".format(deleted_count) }}
+                </span>
+            {% endif %}
+        </label>
+        {% endif %}
+
         <button class="bg-blue-600 hover:bg-blue-700 text-white text-sm rounded px-3 py-1 transition-colors">Apply</button>
         {% if filters or sort %}
         <a href="{{ url_for('sf.table_view', object_name=obj.name) }}" class="text-xs text-slate-500 hover:underline ml-2">Reset</a>
@@ -143,12 +164,17 @@
         </thead>
         <tbody>
             {% for row in rows %}
-            <tr class="border-b hover:bg-slate-50">
+            {% set row_deleted = has_deleted_col and row.get('IsDeleted') %}
+            <tr class="border-b hover:bg-slate-50 {% if row_deleted %}bg-rose-50/40{% endif %}">
                 {% for col in cols %}
                     {% set fmeta = fields_map.get(col) %}
                     <td class="py-1.5 px-3 whitespace-nowrap align-top max-w-xs truncate">
                         {% if col == 'Id' %}
                             <a class="text-blue-700 hover:underline font-mono" href="{{ url_for('sf.record_view', object_name=obj.name, record_id=row[col]) }}">{{ row[col] }}</a>
+                            {% if row_deleted %}
+                                <span class="ml-1 bg-rose-100 text-rose-700 border border-rose-200 px-1 rounded text-[9px] font-medium tracking-wide"
+                                      title="IsDeleted = true · soft-deleted in Salesforce">DELETED</span>
+                            {% endif %}
                         {% else %}
                             {{ render_cell(row[col], fmeta.sf_type if fmeta else None, fmeta.reference_to if fmeta else None, url_for_record, prefix_map=prefix_map, table_names=table_names) }}
                         {% endif %}
