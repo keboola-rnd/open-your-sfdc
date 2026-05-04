@@ -19,6 +19,7 @@ from flask import (
 
 from sf_browser import activity
 from sf_browser import database as db
+from sf_browser import field_history
 from sf_browser import files as sf_files
 from sf_browser import layout
 from sf_browser import migration
@@ -195,6 +196,32 @@ def _context_processor():
 # --------------------------------------------------------------------------- #
 
 
+def _history_parent_lookup(conn) -> dict[str, str]:
+    """Return ``{history_table: parent_object}`` from ``_sf_relationships``.
+
+    Used on the dashboard so each history row links to the object whose
+    changes it tracks. When a history table has multiple inbound parents
+    we prefer the one whose name prefixes the history table — that's the
+    "natural" parent (``AccountHistory`` -> ``Account`` rather than
+    ``Account`` -> ``...`` via some random reference).
+    """
+    try:
+        rows = conn.execute(
+            "SELECT from_object, to_object FROM _sf_relationships "
+            "WHERE to_object IS NOT NULL AND to_object != ''"
+        ).fetchall()
+    except Exception:  # noqa: BLE001
+        return {}
+    out: dict[str, str] = {}
+    for r in rows:
+        h, p = r["from_object"], r["to_object"]
+        if not field_history.is_history_table_name(h):
+            continue
+        if h not in out or h.startswith(p):
+            out[h] = p
+    return out
+
+
 @bp.route("/")
 def dashboard():
     conn = _get_conn()
@@ -211,11 +238,37 @@ def dashboard():
     key_order = {name: i for i, name in enumerate(KEY_OBJECTS)}
     key_objects.sort(key=lambda o: key_order.get(o["name"], 999))
 
-    non_empty = [o for o in objects if (o["record_count"] or 0) > 0 and o["name"] not in key_set]
-    empty = [o for o in objects if (o["record_count"] or 0) == 0 and o["name"] not in key_set]
+    # Pull *History / *__History out into a dedicated category so they
+    # don't drown out regular business objects in "All objects with data".
+    history_set = {
+        o["name"] for o in objects
+        if field_history.is_history_table_name(o["name"])
+    }
+    parent_map = _history_parent_lookup(conn) if history_set else {}
+    history_objects = [
+        o for o in objects
+        if o["name"] in history_set and (o["record_count"] or 0) > 0
+    ]
+    for o in history_objects:
+        o["tracks_object"] = parent_map.get(o["name"])
+    history_objects.sort(key=lambda o: -(o["record_count"] or 0))
+    history_total_records = sum(o["record_count"] or 0 for o in history_objects)
+
+    non_empty = [
+        o for o in objects
+        if (o["record_count"] or 0) > 0
+        and o["name"] not in key_set
+        and o["name"] not in history_set
+    ]
+    empty = [
+        o for o in objects
+        if (o["record_count"] or 0) == 0
+        and o["name"] not in key_set
+        and o["name"] not in history_set
+    ]
 
     # Enrich objects with descriptions.
-    for o in key_objects + non_empty + empty:
+    for o in key_objects + non_empty + empty + history_objects:
         o["description"] = _get_object_description(
             o["name"], o.get("label", ""), o.get("description"),
         )
@@ -226,11 +279,13 @@ def dashboard():
         key_objects=key_objects,
         non_empty_objects=non_empty,
         empty_objects=empty,
+        history_objects=history_objects,
+        history_total_records=history_total_records,
         total_objects=total_objects,
         total_records=total_records,
         exported_at=exported_at,
         custom_count=custom_count,
-        non_empty_count=len(non_empty) + len(key_objects),
+        non_empty_count=len(non_empty) + len(key_objects) + len(history_objects),
         empty_count=len(empty),
     )
 
@@ -310,6 +365,14 @@ def table_view(object_name: str):
     sort_dir = request.args.get("dir", "asc")
     active_filters, open_filters = _collect_filters(request.args, valid_cols)
 
+    # Soft-deleted records (IsDeleted=1, captured by `make export-shutdown`)
+    # are hidden by default to match Salesforce's UI behaviour. The user can
+    # opt in via `?show_deleted=1`. Tables without IsDeleted are unaffected.
+    has_deleted_col = "IsDeleted" in valid_cols
+    show_deleted = request.args.get("show_deleted") == "1"
+    hide_deleted = has_deleted_col and not show_deleted
+    deleted_count = db.count_deleted(conn, object_name) if has_deleted_col else 0
+
     # Resolve reference filters from names to lists of IDs.
     # If the user typed a string that doesn't look like an SF Id, treat it as a
     # name search on the referenced object and convert to an IN clause.
@@ -338,6 +401,7 @@ def table_view(object_name: str):
         sort=sort,
         sort_dir=sort_dir,
         filters=resolved_filters,
+        hide_deleted=hide_deleted,
     )
     total_pages = max(1, (total + page_size - 1) // page_size)
 
@@ -412,6 +476,9 @@ def table_view(object_name: str):
         url_for_record=_url_for_record,
         prefix_map=prefix_map,
         table_names=table_names,
+        has_deleted_col=has_deleted_col,
+        show_deleted=show_deleted,
+        deleted_count=deleted_count,
     )
 
 
@@ -624,6 +691,13 @@ def record_view(object_name: str, record_id: str):
     # Unified activity timeline (Task + Event + EmailMessage).
     activity_timeline = activity.build_timeline(conn, obj["name"], record["Id"])
 
+    # Field-level audit log (AccountHistory, *FieldHistory, *__History).
+    # Empty list when the org doesn't track this object or the export
+    # didn't include `--include-history`.
+    field_changes = field_history.build_field_history(
+        conn, obj["name"], record["Id"]
+    )
+
     # Attached binary files (Attachments + ContentDocumentLink → ContentVersion).
     record_files = sf_files.files_for_record(conn, obj["name"], record["Id"])
 
@@ -650,6 +724,7 @@ def record_view(object_name: str, record_id: str):
         child_fields_map=child_fields_map,
         child_name_cache=child_name_cache,
         activity_timeline=activity_timeline,
+        field_changes=field_changes,
         record_files=record_files,
         view_mode="keboola",
     )

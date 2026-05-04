@@ -522,6 +522,62 @@
         </details>
         {% endif %}
 
+        {# Field-level audit log — Lightning's "Audit Trail". Sourced from
+           AccountHistory / *FieldHistory / *__History tables (any table
+           with the Field/OldValue/NewValue triplet shape).
+           Empty when the org has no field-history tracking enabled, or
+           when the export ran without `--include-history`. #}
+        {% if field_changes %}
+        <details class="kb-section bg-white rounded-lg shadow-sm border border-slate-200 group">
+            <summary class="text-sm font-semibold text-slate-700 px-3 py-2 border-b border-slate-200 bg-slate-50 rounded-t-lg cursor-pointer list-none flex items-center justify-between hover:bg-slate-100">
+                <span>
+                    <span class="chevron text-slate-400">▸</span>
+                    Field changes
+                    <span class="text-slate-400 font-normal text-xs ml-1">({{ field_changes|length }})</span>
+                </span>
+            </summary>
+            <ol class="max-h-[70vh] overflow-y-auto divide-y divide-slate-100">
+                {% for entry in field_changes %}
+                <li class="px-3 py-2 text-xs hover:bg-slate-50">
+                    <div class="flex items-center gap-2 text-[10px] text-slate-500 mb-0.5">
+                        <span class="tabular-nums">{{ entry.date_formatted or '–' }}</span>
+                        {% if entry.user_id %}
+                            <span class="text-slate-300">·</span>
+                            <a class="text-blue-700 hover:underline truncate max-w-[140px]"
+                               href="{{ url_for('sf.record_view', object_name='User', record_id=entry.user_id) }}">
+                                {{ entry.user_name or entry.user_id[:8] ~ '…' }}
+                            </a>
+                        {% endif %}
+                    </div>
+                    <div class="text-slate-700">
+                        changed
+                        <span class="font-medium" title="{{ entry.field_api }}">
+                            {{ entry.field_label or entry.field_api }}
+                        </span>
+                    </div>
+                    <div class="mt-0.5 grid grid-cols-[auto_1fr] gap-x-2 gap-y-0.5 text-[11px]">
+                        <span class="text-slate-400 uppercase tracking-wide">from</span>
+                        <span class="font-mono break-all
+                                     {% if entry.old_value in (None, '') %}text-slate-400 italic{% else %}text-slate-700{% endif %}">
+                            {% if entry.old_value in (None, '') %}(empty){% else %}{{ entry.old_value }}{% endif %}
+                        </span>
+                        <span class="text-slate-400 uppercase tracking-wide">to</span>
+                        <span class="font-mono break-all
+                                     {% if entry.new_value in (None, '') %}text-slate-400 italic{% else %}text-emerald-700{% endif %}">
+                            {% if entry.new_value in (None, '') %}(empty){% else %}{{ entry.new_value }}{% endif %}
+                        </span>
+                    </div>
+                    {% if entry.source != obj.name ~ 'History' %}
+                    <div class="mt-0.5 text-[9px] text-slate-400 font-mono">
+                        via {{ entry.source }}
+                    </div>
+                    {% endif %}
+                </li>
+                {% endfor %}
+            </ol>
+        </details>
+        {% endif %}
+
         {# Migration hint — tiny, unobtrusive, reminds the user of the project goal #}
         <section class="bg-emerald-50 border border-emerald-200 rounded-lg p-3">
             <div class="text-[11px] uppercase tracking-wide text-emerald-700 mb-1">Migration</div>

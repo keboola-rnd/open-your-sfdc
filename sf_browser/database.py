@@ -232,12 +232,17 @@ def fetch_records(
     sort: str | None = None,
     sort_dir: str = "asc",
     filters: dict[str, Any] | None = None,
+    hide_deleted: bool = False,
 ) -> tuple[list[sqlite3.Row], int]:
     """Paginated/sorted/filtered fetch over a single object's table.
 
     Filter value semantics:
       - ``str``       → column LIKE '%val%' (substring match).
       - ``list[str]`` → column IN (v1, v2, ...). Empty list forces zero results.
+
+    When ``hide_deleted`` is True and the table has an ``IsDeleted`` column,
+    rows where ``IsDeleted = 1`` are excluded. Tables without an
+    ``IsDeleted`` column are unaffected (the flag is silently ignored).
     """
     if not is_safe_ident(object_name):
         raise ValueError("invalid object name")
@@ -245,6 +250,8 @@ def fetch_records(
     valid_cols = set(table_columns(conn, object_name))
     where_clauses: list[str] = []
     params: list[Any] = []
+    if hide_deleted and "IsDeleted" in valid_cols:
+        where_clauses.append('("IsDeleted" = 0 OR "IsDeleted" IS NULL)')
     if filters:
         for col, val in filters.items():
             if col not in valid_cols:
@@ -276,6 +283,23 @@ def fetch_records(
     )
     rows = conn.execute(data_sql, (*params, page_size, offset)).fetchall()
     return rows, total
+
+
+def count_deleted(conn: sqlite3.Connection, object_name: str) -> int:
+    """Return the number of soft-deleted rows in the table, or 0 if the
+    object has no ``IsDeleted`` column.
+    """
+    if not is_safe_ident(object_name):
+        return 0
+    cols = set(table_columns(conn, object_name))
+    if "IsDeleted" not in cols:
+        return 0
+    try:
+        return conn.execute(
+            f'SELECT COUNT(*) FROM {quote_ident(object_name)} WHERE "IsDeleted" = 1'
+        ).fetchone()[0]
+    except sqlite3.DatabaseError:
+        return 0
 
 
 def get_record(
