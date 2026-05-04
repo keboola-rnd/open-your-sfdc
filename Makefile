@@ -1,4 +1,4 @@
-.PHONY: help install export export-dry export-history rebuild-metadata import refresh files files-force files-dry files-audit files-gaps describe metadata metadata-dry sfdx-check sfdx-retrieve event-logs event-logs-dry archive archive-audit browser browser-stop
+.PHONY: help install export export-dry export-history export-shutdown rebuild-metadata import refresh files files-force files-dry files-audit files-gaps describe metadata metadata-dry sfdx-check sfdx-retrieve event-logs event-logs-dry archive archive-shutdown archive-audit browser browser-stop
 
 help: ## Show this help
 	@awk 'BEGIN {FS = ":.*?## "} \
@@ -22,6 +22,9 @@ export-dry: ## Dry-run: list what would be exported
 
 export-history: ## Export including *__History field-history tables (full refresh; can be huge)
 	.venv/bin/python scripts/export_all.py --include-history
+
+export-shutdown: ## Decommission-grade export: __History tables + soft-deleted records (full refresh; slowest)
+	.venv/bin/python scripts/export_all.py --include-history --include-deleted
 
 import: ## Drop + rebuild SQLite DB from CSV (data/salesforce_full.db)
 	.venv/bin/python scripts/import_to_sqlite.py
@@ -97,6 +100,24 @@ archive: ## Full backup: data + binaries + metadata + SFDX + event logs + audit
 	@echo "\n== 6/6 SFDX retrieve (may skip if CLI missing) =="
 	-$(MAKE) sfdx-retrieve
 	@echo "\n== Optional: Event Monitoring logs =="
+	-$(MAKE) event-logs
+	@echo "\n== Final: archive audit =="
+	-$(MAKE) archive-audit
+
+archive-shutdown: ## Decommissioning archive: includes __History tables + soft-deleted records + force-refresh files
+	@echo "== 1/7 Export data (with __History + soft-deleted) =="
+	$(MAKE) export-shutdown
+	@echo "\n== 2/7 Import to SQLite =="
+	$(MAKE) import
+	@echo "\n== 3/7 Force re-download all binaries (catches updated Attachment/Document bodies) =="
+	$(MAKE) files-force
+	@echo "\n== 4/7 Fetch SDocs + chatter refs =="
+	$(MAKE) files-gaps
+	@echo "\n== 5/7 Tooling API metadata =="
+	$(MAKE) metadata
+	@echo "\n== 6/7 SFDX retrieve (may skip if CLI missing) =="
+	-$(MAKE) sfdx-retrieve
+	@echo "\n== 7/7 Event Monitoring logs (needs licence) =="
 	-$(MAKE) event-logs
 	@echo "\n== Final: archive audit =="
 	-$(MAKE) archive-audit
