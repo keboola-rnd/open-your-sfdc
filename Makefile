@@ -92,11 +92,11 @@ archive: ## Full backup: data + binaries + metadata + SFDX + event logs + audit
 	@echo "\n== 2/6 Import to SQLite =="
 	$(MAKE) import
 	@echo "\n== 3/6 Download binaries =="
-	$(MAKE) files
+	-$(MAKE) files
 	@echo "\n== 4/6 Fetch SDocs + chatter refs =="
-	$(MAKE) files-gaps
+	-$(MAKE) files-gaps
 	@echo "\n== 5/6 Tooling API metadata =="
-	$(MAKE) metadata
+	-$(MAKE) metadata
 	@echo "\n== 6/6 SFDX retrieve (may skip if CLI missing) =="
 	-$(MAKE) sfdx-retrieve
 	@echo "\n== Optional: Event Monitoring logs =="
@@ -110,11 +110,11 @@ archive-shutdown: ## Decommissioning archive: includes __History tables + soft-d
 	@echo "\n== 2/7 Import to SQLite =="
 	$(MAKE) import
 	@echo "\n== 3/7 Force re-download all binaries (catches updated Attachment/Document bodies) =="
-	$(MAKE) files-force
+	-$(MAKE) files-force
 	@echo "\n== 4/7 Fetch SDocs + chatter refs =="
-	$(MAKE) files-gaps
+	-$(MAKE) files-gaps
 	@echo "\n== 5/7 Tooling API metadata =="
-	$(MAKE) metadata
+	-$(MAKE) metadata
 	@echo "\n== 6/7 SFDX retrieve (may skip if CLI missing) =="
 	-$(MAKE) sfdx-retrieve
 	@echo "\n== 7/7 Event Monitoring logs (needs licence) =="
