@@ -97,7 +97,10 @@ def download_content_versions(
 
         filename = safe_filename(f"{title}.{ext}" if ext else title)
         subdir = out_dir / safe_filename(doc_id)
-        filepath = subdir / filename
+        # Collision guard: multiple ContentVersions can share a filename within
+        # the same ContentDocument (e.g. multiple revisions or SDocs PDFs with
+        # the same Title). Prefix with the CV Id short form to disambiguate.
+        filepath = subdir / f"{cv_id[:15]}__{filename}"
 
         if resume and filepath.exists() and filepath.stat().st_size > 0:
             stats["skipped"] += 1
@@ -294,12 +297,61 @@ def download_external_refs(
     except sqlite3.DatabaseError:
         pass
 
+    # DocuSign for Salesforce (dfsle) — each dfsle__Document__c row of
+    # type 'ContentVersion' references an Order Form / signed PDF / template
+    # via dfsle__SourceId__c. Most rows store a *ContentDocument* Id (069...
+    # prefix) which has to be resolved to the latest ContentVersion via SOQL,
+    # the same dance ContentAsset uses. A handful store a ContentVersion Id
+    # directly (068... prefix) and can be downloaded as-is.
+    docusign_cv_targets: set[str] = set()      # 068... — direct CV
+    docusign_cd_targets: set[str] = set()      # 069... — ContentDocument, resolve later
+    docusign_metadata: dict[str, dict] = {}    # keyed by source_id (068 or 069)
+    try:
+        rows = conn.execute(
+            'SELECT d.Id AS doc_id, '
+            'd.dfsle__SourceId__c AS source_id, '
+            'd.Name AS filename, '
+            'd.dfsle__Extension__c AS ext, '
+            'd.dfsle__Sequence__c AS seq, '
+            'd.dfsle__Envelope__c AS envelope_id, '
+            'e.dfsle__SourceId__c AS parent_id '
+            'FROM "dfsle__Document__c" d '
+            'LEFT JOIN "dfsle__Envelope__c" e ON e.Id = d.dfsle__Envelope__c '
+            "WHERE d.dfsle__Type__c = 'ContentVersion' "
+            "AND d.dfsle__SourceId__c IS NOT NULL "
+            "AND d.dfsle__SourceId__c != ''"
+        ).fetchall()
+        for r in rows:
+            sid = r["source_id"]
+            if not sid:
+                continue
+            md = {
+                "doc_id": r["doc_id"],
+                "filename": r["filename"] or sid,
+                "extension": r["ext"] or "",
+                "envelope_id": r["envelope_id"],
+                "parent_id": r["parent_id"],
+                "sequence": r["seq"],
+            }
+            # Keep first-seen metadata per source id (envelopes may share refs).
+            docusign_metadata.setdefault(sid, md)
+            if sid.startswith("069"):
+                docusign_cd_targets.add(sid)
+            elif sid.startswith("068") and sid not in cv_ids:
+                docusign_cv_targets.add(sid)
+    except sqlite3.DatabaseError:
+        pass
+
     conn.close()
 
-    total = len(fa_targets) + len(ca_doc_targets) + len(sdoc_targets)
+    docusign_total = len(docusign_cv_targets) + len(docusign_cd_targets)
+    total = (len(fa_targets) + len(ca_doc_targets)
+             + len(sdoc_targets) + docusign_total)
     print(f"Found {len(fa_targets)} chatter ContentVersion refs, "
           f"{len(ca_doc_targets)} ContentAsset ContentDocument refs, "
-          f"{len(sdoc_targets)} SDocs PDFs (invoices/quotes)")
+          f"{len(sdoc_targets)} SDocs PDFs (invoices/quotes), "
+          f"{docusign_total} DocuSign documents (Order Forms / contracts; "
+          f"{len(docusign_cd_targets)} CD + {len(docusign_cv_targets)} CV)")
     print(f"  Total external targets: {total}")
 
     stats = {"total": total, "downloaded": 0, "skipped": 0, "errors": 0, "bytes": 0}
@@ -331,11 +383,46 @@ def download_external_refs(
             except Exception as exc:  # noqa: BLE001
                 print(f"  ! ContentAsset lookup chunk failed: {exc}")
 
+    # Resolve DocuSign ContentDocument refs → latest CV ids via SOQL.
+    # docusign_metadata is keyed by source_id (069...); after resolution we
+    # rekey it to the resolved cv_id so the download loop can find it.
+    docusign_targets: set[str] = set(docusign_cv_targets)
+    if docusign_cd_targets:
+        print(f"  Resolving {len(docusign_cd_targets)} DocuSign ContentDocuments to latest ContentVersions...")
+        cd_ids_list = list(docusign_cd_targets)
+        for chunk_start in range(0, len(cd_ids_list), 200):
+            chunk = cd_ids_list[chunk_start:chunk_start + 200]
+            placeholders = ",".join(f"'{d}'" for d in chunk)
+            soql = (
+                f"SELECT Id, ContentDocumentId, Title, FileExtension, "
+                f"ContentSize, CreatedDate FROM ContentVersion "
+                f"WHERE ContentDocumentId IN ({placeholders}) AND IsLatest = true"
+            )
+            try:
+                res = sf.query_all(soql)
+                for rec in res.get("records", []):
+                    cv_id = rec["Id"]
+                    cd_id = rec["ContentDocumentId"]
+                    docusign_targets.add(cv_id)
+                    # Move metadata from CD-key to CV-key so the loop finds it.
+                    if cd_id in docusign_metadata:
+                        docusign_metadata[cv_id] = docusign_metadata.pop(cd_id)
+                    # Also keep the SF-side meta for size/createdDate fallback.
+                    manifest.setdefault(f"__ca_meta_{cv_id}", rec)
+            except Exception as exc:  # noqa: BLE001
+                print(f"  ! DocuSign lookup chunk failed: {exc}")
+        resolved_cd_count = sum(1 for k in docusign_metadata if k.startswith("068"))
+        print(f"    resolved: {resolved_cd_count}, "
+              f"unresolved: {len(docusign_cd_targets) - resolved_cd_count} "
+              f"(CV deleted or no access)")
+
     # Merge all CV targets into a single download queue, carrying known metadata
     # so we can name SDocs PDFs properly (301000587.pdf instead of Id-only).
-    all_targets = fa_targets | sdoc_targets
+    all_targets = fa_targets | sdoc_targets | docusign_targets
     for cv_id, md in sdoc_metadata.items():
         manifest.setdefault(f"__sdoc_meta_{cv_id}", md)
+    for cv_id, md in docusign_metadata.items():
+        manifest.setdefault(f"__docusign_meta_{cv_id}", md)
 
     target_list = sorted(all_targets)
     print(f"  Downloading {len(target_list)} external ContentVersions...")
@@ -343,6 +430,7 @@ def download_external_refs(
     for i, cv_id in enumerate(target_list):
         meta = manifest.get(f"__ca_meta_{cv_id}") or {}
         sdoc_md = manifest.get(f"__sdoc_meta_{cv_id}") or {}
+        docusign_md = manifest.get(f"__docusign_meta_{cv_id}") or {}
         title = meta.get("Title", cv_id)
         ext = meta.get("FileExtension", "")
         doc_id = meta.get("ContentDocumentId", "external")
@@ -355,8 +443,18 @@ def download_external_refs(
                 title = title.rsplit(".", 1)[0]
             doc_id = sdoc_md.get("parent_id") or doc_id
 
+        # DocuSign: filename + extension come from dfsle__Document__c.
+        if docusign_md.get("filename"):
+            title = docusign_md["filename"]
+            ext = docusign_md.get("extension") or ext
+            # Strip extension from name if it was duplicated (e.g. "Foo.docx").
+            if ext and title.lower().endswith(f".{ext.lower()}"):
+                title = title[: -(len(ext) + 1)]
+            # Group signed envelope artifacts under the parent record (Order/Opp).
+            doc_id = docusign_md.get("parent_id") or docusign_md.get("envelope_id") or doc_id
+
         # Look up metadata if we don't have it (FeedAttachment path).
-        if not ext and not sdoc_md:
+        if not ext and not sdoc_md and not docusign_md:
             try:
                 lookup = sf.query(
                     f"SELECT Id, ContentDocumentId, Title, FileExtension, "
@@ -374,7 +472,10 @@ def download_external_refs(
 
         filename = safe_filename(f"{title}.{ext}" if ext else title)
         subdir = out_dir / safe_filename(doc_id)
-        filepath = subdir / filename
+        # Collision guard: SDocs PDFs and other external refs frequently share
+        # filenames (Invoice-0000024.pdf etc.). Prefix with CV Id to keep them
+        # distinct on disk.
+        filepath = subdir / f"{cv_id[:15]}__{filename}"
 
         if resume and filepath.exists() and filepath.stat().st_size > 0:
             stats["skipped"] += 1
@@ -401,10 +502,16 @@ def download_external_refs(
                 "size": meta.get("ContentSize", len(resp.content)),
                 "path": str(filepath.relative_to(FILES_DIR)),
                 "created_date": meta.get("CreatedDate"),
-                "source": "sdoc" if sdoc_md else "external_ref",
+                "source": ("sdoc" if sdoc_md
+                           else "docusign" if docusign_md
+                           else "external_ref"),
                 **({"sdoc_id": sdoc_md["sdoc_id"],
                     "parent_id": sdoc_md.get("parent_id"),
                     "parent_type": sdoc_md.get("parent_type")} if sdoc_md else {}),
+                **({"docusign_doc_id": docusign_md["doc_id"],
+                    "envelope_id": docusign_md.get("envelope_id"),
+                    "parent_id": docusign_md.get("parent_id"),
+                    "sequence": docusign_md.get("sequence")} if docusign_md else {}),
             }
             if (i + 1) % 10 == 0:
                 print(f"  [{i + 1}/{total}] Downloaded {title}.{ext}")
@@ -414,7 +521,9 @@ def download_external_refs(
 
     # Strip cache entries.
     for key in list(manifest.keys()):
-        if key.startswith("__ca_meta_") or key.startswith("__sdoc_meta_"):
+        if (key.startswith("__ca_meta_")
+                or key.startswith("__sdoc_meta_")
+                or key.startswith("__docusign_meta_")):
             del manifest[key]
 
     return stats
@@ -452,7 +561,9 @@ def download_documents(
 
         filename = safe_filename(name)
         subdir = out_dir / safe_filename(folder_id)
-        filepath = subdir / filename
+        # Collision guard: classic Documents in the same folder can share names.
+        # Prefix with Document Id short form to disambiguate.
+        filepath = subdir / f"{doc_id[:15]}__{filename}"
 
         if resume and filepath.exists() and filepath.stat().st_size > 0:
             stats["skipped"] += 1
