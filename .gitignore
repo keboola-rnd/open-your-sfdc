@@ -8,3 +8,5 @@ data/
 .DS_Store
 *.log
 *.zip
+*.bak
+.claude/
