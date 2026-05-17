@@ -68,6 +68,17 @@ def utc_now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _available_event_log_fields(sf: Salesforce) -> set[str]:
+    """Return the set of field names actually present on EventLogFile in this org.
+
+    ``Sequence`` and ``Interval`` only exist for orgs with **hourly** Event
+    Log Files enabled. Without them, including those columns in a SOQL SELECT
+    fails with INVALID_FIELD — so we probe the schema first.
+    """
+    describe = sf.restful("sobjects/EventLogFile/describe", method="GET") or {}
+    return {f.get("name") for f in describe.get("fields", []) if f.get("name")}
+
+
 def query_event_log_files(
     sf: Salesforce,
     *,
@@ -81,11 +92,25 @@ def query_event_log_files(
     if event_types:
         quoted = ",".join(f"'{t}'" for t in event_types)
         where_clauses.append(f"EventType IN ({quoted})")
+
+    # Always-present fields per the standard EventLogFile schema.
+    base_fields = [
+        "Id", "EventType", "LogDate", "LogFileLength",
+        "LogFileFieldNames", "ApiVersion", "CreatedDate",
+    ]
+    # Hourly-ELF-only fields — include only if the org's schema exposes them.
+    available = _available_event_log_fields(sf)
+    optional = [f for f in ("Sequence", "Interval") if f in available]
+    select_fields = base_fields + optional
+
+    order_by = "LogDate DESC, EventType"
+    if "Sequence" in optional:
+        order_by += ", Sequence"
+
     soql = (
-        "SELECT Id, EventType, LogDate, LogFileLength, LogFileFieldNames, "
-        "Sequence, Interval, ApiVersion, CreatedDate "
+        f"SELECT {', '.join(select_fields)} "
         f"FROM EventLogFile WHERE {' AND '.join(where_clauses)} "
-        "ORDER BY LogDate DESC, EventType, Sequence"
+        f"ORDER BY {order_by}"
     )
     result = sf.query_all(soql)
     return result.get("records", [])
@@ -105,10 +130,13 @@ def download_one(
     event_type = record.get("EventType", "UnknownEvent")
     log_date = (record.get("LogDate") or "")[:10] or "unknown-date"
     interval = record.get("Interval") or "Daily"
-    seq = record.get("Sequence") or 0
+    # Sequence is only set for hourly ELFs; fall back to Id suffix so multiple
+    # daily rows of the same EventType+LogDate cannot collide on disk.
+    seq = record.get("Sequence")
+    discriminator = seq if seq not in (None, "") else elf_id
 
     subdir = LOGS_DIR / log_date
-    filename = safe_filename(f"{event_type}_{interval}_{seq}.csv")
+    filename = safe_filename(f"{event_type}_{interval}_{discriminator}.csv")
     filepath = subdir / filename
 
     if resume and filepath.exists() and filepath.stat().st_size > 0:
@@ -176,12 +204,20 @@ def main(argv: list[str] | None = None) -> int:
     try:
         records = query_event_log_files(sf, days=args.days, event_types=event_types)
     except SalesforceError as exc:
-        # INVALID_TYPE usually means the org doesn't expose EventLogFile
-        # (typically: no Salesforce Shield / Event Monitoring licence).
+        msg = str(exc)
         print(f"\n  ! Could not query EventLogFile: {exc}")
-        print("  This usually means the org has no Event Monitoring licence.")
-        print("  With no licence the retention is 1 day — any older logs are")
-        print("  permanently gone regardless of tooling.")
+        if "INVALID_TYPE" in msg or "sObject type 'EventLogFile'" in msg:
+            print("  The EventLogFile object is not exposed in this org — that")
+            print("  means no Event Monitoring licence at all. Without the")
+            print("  licence retention is 1 day, so older logs are gone.")
+        elif "INVALID_FIELD" in msg:
+            print("  A field in the SELECT is not in this org's schema. We probe")
+            print("  EventLogFile.describe to omit hourly-only fields, so this")
+            print("  most likely means the org's schema lacks one of the base")
+            print("  fields — escalate to a Salesforce admin.")
+        else:
+            print("  Without an Event Monitoring licence, retention is only 1 day,")
+            print("  so older logs are permanently gone regardless of tooling.")
         return 2
 
     print(f"Found {len(records)} EventLogFile row(s)")

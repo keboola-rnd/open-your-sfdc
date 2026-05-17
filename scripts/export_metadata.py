@@ -141,11 +141,12 @@ def export_flow(
     stats = {"type": "Flow", "total": 0, "written": 0, "skipped": 0, "errors": 0}
     errors: list[str] = []
 
-    # 1. Enumerate all Flow versions (no Metadata to avoid the single-record restriction).
+    # DeveloperName lives on FlowDefinition, not Flow — Flow is versioned and
+    # only exposes the developer name via the Definition relationship.
     soql = (
-        "SELECT Id, DeveloperName, MasterLabel, Status, VersionNumber, "
+        "SELECT Id, Definition.DeveloperName, MasterLabel, Status, VersionNumber, "
         "ProcessType, ApiVersion, LastModifiedDate, ManageableState "
-        "FROM Flow ORDER BY DeveloperName, VersionNumber"
+        "FROM Flow ORDER BY Definition.DeveloperName, VersionNumber"
     )
     try:
         flows = tooling_query(sf, soql)
@@ -159,7 +160,11 @@ def export_flow(
     if not dry_run:
         type_dir = out_dir / "Flow"
         for i, flow in enumerate(flows, start=1):
-            dev_name = flow.get("DeveloperName", flow["Id"])
+            definition = flow.get("Definition") or {}
+            dev_name = (
+                definition.get("DeveloperName")
+                if isinstance(definition, dict) else None
+            ) or flow.get("MasterLabel") or flow["Id"]
             version = flow.get("VersionNumber", 0)
             filename = f"{dev_name}__v{version}"
             try:
@@ -235,13 +240,35 @@ def _export_with_metadata_per_id(
         return stats
 
     type_dir = out_dir / object_type
+    # Track filenames already used in *this run* so that genuine duplicates
+    # (same parent + same DeveloperName + same NamespacePrefix — Salesforce
+    # really does allow these in some orgs) get an Id-suffix instead of
+    # silently overwriting each other.
+    seen: set[str] = set()
     for i, rec in enumerate(records, start=1):
-        raw_name = rec.get(name_field) or rec.get("FullName") or rec["Id"]
-        # Validation rules are named like "Account.MyRule"; keep that prefix
-        # to disambiguate rules with the same name across different objects.
+        raw_name = rec.get(name_field) or rec.get("FullName")
+        # Disambiguate names that repeat across parent objects (e.g.
+        # 32 different ``Status`` custom fields, one per host object).
+        # Different Tooling objects expose the parent under different names:
+        #   - ValidationRule:           EntityDefinition.QualifiedApiName
+        #   - CustomField, WorkflowRule:TableEnumOrId
+        #   - WorkflowFieldUpdate:      SourceTableEnumOrId
+        #   - WorkflowTask / *OutboundMessage: EntityDefinitionId (raw Id)
         entity = rec.get("EntityDefinition") or {}
-        qualifier = entity.get("QualifiedApiName") if isinstance(entity, dict) else None
-        filename = f"{qualifier}.{raw_name}" if qualifier else raw_name
+        qualifier = (
+            (entity.get("QualifiedApiName") if isinstance(entity, dict) else None)
+            or rec.get("TableEnumOrId")
+            or rec.get("SourceTableEnumOrId")
+            or rec.get("EntityDefinitionId")
+        )
+        # NamespacePrefix splits managed-package fields ("SalesLoft1") from
+        # unmanaged ones (null) — necessary for orgs with multiple packages
+        # that ship fields with the same DeveloperName on the same object.
+        namespace = rec.get("NamespacePrefix")
+        parts = [p for p in (qualifier, namespace, raw_name) if p]
+        base = ".".join(parts) if parts else rec["Id"]
+        filename = base if base not in seen else f"{base}__{rec['Id']}"
+        seen.add(filename)
         try:
             full = tooling_sobject(sf, object_type, rec["Id"])
             if _write_record(type_dir, filename, full, resume=resume):
@@ -261,6 +288,9 @@ def _export_with_metadata_per_id(
 
 
 def export_validation_rule(sf, out_dir, *, dry_run, resume):
+    # NB: ORDER BY EntityDefinition.QualifiedApiName triggers a 500
+    # UNKNOWN_EXCEPTION on Tooling API — keep the relationship in SELECT
+    # (for the filename prefix) but order by a flat column only.
     return _export_with_metadata_per_id(
         sf,
         object_type="ValidationRule",
@@ -268,7 +298,7 @@ def export_validation_rule(sf, out_dir, *, dry_run, resume):
             "SELECT Id, ValidationName, Active, Description, ErrorMessage, "
             "ErrorDisplayField, EntityDefinitionId, EntityDefinition.QualifiedApiName, "
             "CreatedById, CreatedDate, LastModifiedById, LastModifiedDate "
-            "FROM ValidationRule ORDER BY EntityDefinition.QualifiedApiName, ValidationName"
+            "FROM ValidationRule ORDER BY ValidationName"
         ),
         name_field="ValidationName",
         out_dir=out_dir,
@@ -293,12 +323,17 @@ def export_workflow_rule(sf, out_dir, *, dry_run, resume):
 
 
 def export_workflow_field_update(sf, out_dir, *, dry_run, resume):
+    # Real Tooling schema (v59.0, confirmed via describe):
+    # Id, Name, SourceTableEnumOrId, LiteralValue, LookupValueId,
+    # EntityDefinitionId, FieldDefinitionId, Metadata, FullName, ...
+    # NB: EntityDefinition.QualifiedApiName join returns 500 UNKNOWN_EXCEPTION
+    # on Workflow* objects — use the flat *Id column instead.
     return _export_with_metadata_per_id(
         sf,
         object_type="WorkflowFieldUpdate",
         list_soql=(
-            "SELECT Id, FullName, Name, TableEnumOrId "
-            "FROM WorkflowFieldUpdate ORDER BY TableEnumOrId, Name"
+            "SELECT Id, Name, SourceTableEnumOrId, EntityDefinitionId "
+            "FROM WorkflowFieldUpdate ORDER BY SourceTableEnumOrId, Name"
         ),
         name_field="Name",
         out_dir=out_dir,
@@ -308,14 +343,17 @@ def export_workflow_field_update(sf, out_dir, *, dry_run, resume):
 
 
 def export_workflow_task(sf, out_dir, *, dry_run, resume):
+    # Real Tooling schema (v59.0): Id, Subject, Status, Priority,
+    # EntityDefinitionId, Metadata, FullName, ... There is NO Name column —
+    # Subject is the human-readable label.
     return _export_with_metadata_per_id(
         sf,
         object_type="WorkflowTask",
         list_soql=(
-            "SELECT Id, FullName, Name, TableEnumOrId "
-            "FROM WorkflowTask ORDER BY TableEnumOrId, Name"
+            "SELECT Id, Subject, EntityDefinitionId "
+            "FROM WorkflowTask ORDER BY Subject"
         ),
-        name_field="Name",
+        name_field="Subject",
         out_dir=out_dir,
         dry_run=dry_run,
         resume=resume,
@@ -323,12 +361,14 @@ def export_workflow_task(sf, out_dir, *, dry_run, resume):
 
 
 def export_workflow_outbound_message(sf, out_dir, *, dry_run, resume):
+    # Real Tooling schema (v59.0): Id, Name, IntegrationUserId, ApiVersion,
+    # EntityDefinitionId, Metadata, FullName, ... (no EndpointUrl/TargetObject).
     return _export_with_metadata_per_id(
         sf,
         object_type="WorkflowOutboundMessage",
         list_soql=(
-            "SELECT Id, FullName, Name, TableEnumOrId "
-            "FROM WorkflowOutboundMessage ORDER BY TableEnumOrId, Name"
+            "SELECT Id, Name, ApiVersion, EntityDefinitionId "
+            "FROM WorkflowOutboundMessage ORDER BY Name"
         ),
         name_field="Name",
         out_dir=out_dir,
@@ -340,15 +380,15 @@ def export_workflow_outbound_message(sf, out_dir, *, dry_run, resume):
 def export_custom_field(sf, out_dir, *, dry_run, resume):
     """Export CustomField metadata including formulas, defaults, picklist sources.
 
-    CustomField.Metadata has the single-record restriction too. This is the
-    heaviest call in this whole script because there are usually many custom
-    fields. ``--resume`` makes subsequent runs nearly free.
+    FullName/Metadata can only appear in single-row SOQL. We enumerate without
+    FullName and identify each field via TableEnumOrId + DeveloperName, then
+    fetch the full record (incl. Metadata) per Id via the REST sobject endpoint.
     """
     return _export_with_metadata_per_id(
         sf,
         object_type="CustomField",
         list_soql=(
-            "SELECT Id, DeveloperName, TableEnumOrId, FullName, "
+            "SELECT Id, DeveloperName, TableEnumOrId, "
             "ManageableState, NamespacePrefix "
             "FROM CustomField ORDER BY TableEnumOrId, DeveloperName"
         ),
