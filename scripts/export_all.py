@@ -352,10 +352,18 @@ def get_parent_ids(
 
     Reads from the local parent CSV when present (the common case during a
     full export, since discover_objects() pins parents before children). Falls
-    back to a live ``SELECT <col> FROM <parent_object>`` when the CSV is missing
-    — this matters for ad-hoc ``--objects ContentDocumentLink`` runs. The
-    fallback honours MANDATORY_WHERE so a parent like ContentVersion isn't
-    itself scoped to a 30-row sample (which would re-truncate the chain).
+    back to a live query when the CSV is missing — this matters for ad-hoc
+    ``--objects ContentDocumentLink`` runs that skip the parent. Two fallbacks:
+
+    * If the parent is itself a derived filter-required object (e.g.
+      ContentDocument, which a plain ``SELECT Id FROM ContentDocument`` would
+      scope to ~30 rows just like ContentVersion), rebuild it from ITS parent
+      via the same chunked machinery, so the chain doesn't silently re-truncate
+      (ContentDocumentLink -> ContentDocument -> ContentVersion). Recursion is
+      bounded by the Files chain (max 2 hops).
+    * Otherwise query ``SELECT <col> FROM <parent_object>`` directly, honouring
+      MANDATORY_WHERE so a parent like ContentVersion isn't scoped to a 30-row
+      sample.
     """
     if parent_csv.exists() and parent_csv.stat().st_size > 0:
         ids: list[str] = []
@@ -366,6 +374,19 @@ def get_parent_ids(
                 if pid:
                     ids.append(pid)
         return ids
+
+    if parent_object in FILTER_REQUIRED_OBJECTS and parent_id_column == "Id":
+        gp_object, gp_filter, gp_col, gp_chunk = FILTER_REQUIRED_OBJECTS[parent_object]
+        gp_csv = parent_csv.parent / f"{gp_object}.csv"
+        print(
+            f"    parent CSV {parent_csv.name} missing -> rebuilding {parent_object} "
+            f"from {gp_object} (derived object; a plain SELECT would be scoped)"
+        )
+        grandparent_ids = get_parent_ids(sf, gp_object, gp_csv, gp_col)
+        records = query_chunked_by_parent_ids(
+            sf, parent_object, ["Id"], gp_filter, grandparent_ids, gp_chunk
+        )
+        return [rec["Id"] for rec in records if rec.get("Id")]
 
     where = MANDATORY_WHERE.get(parent_object)
     where_clause = f" WHERE {where}" if where else ""
