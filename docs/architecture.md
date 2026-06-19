@@ -93,6 +93,36 @@ a web-based browser for exploring it. This replaces the current piecemeal approa
 
 ---
 
+## File → record link layer
+
+Binary files (signed order PDFs, contracts, invoices) are only useful if you
+can answer *"which Order / Opportunity / Account is this attached to?"*. Two
+mechanisms keep that join complete:
+
+1. **Export side** (`export_all.py`) — `ContentVersion` and `ContentDocument`
+   are silently scoped by the Salesforce Files query-planner to a ~30-row
+   sample on an unfiltered `SELECT`. We force the full set via `MANDATORY_WHERE`
+   (`ContentVersion WHERE IsLatest = true`) and derive `ContentDocument` from
+   it, which lets the existing `FILTER_REQUIRED_OBJECTS` machinery rebuild the
+   full `ContentDocumentLink` (every `LinkedEntityId ↔ ContentDocumentId`). The
+   chain is pinned to export ContentVersion → ContentDocument →
+   ContentDocumentLink (`FILES_EXPORT_ORDER`), since each is derived from the
+   previous one's CSV.
+
+2. **Manifest side** (`download_files.py`) — every `sf_files/manifest.json`
+   entry is enriched with a typed `linked_entity_id` / `linked_entity_type`,
+   resolved in precedence order from `ContentDocumentLink` →
+   `FirstPublishLocationId` → DocuSign/SDoc parent id. `content_document_id` is
+   kept to the real `069…` id only (no longer overloaded with parent/envelope
+   ids).
+
+This is what recovers DocuSign signed-PDF → Order links: DocuSign writes the
+completed PDF back as a normal `ContentVersion` linked to the Order via
+`ContentDocumentLink`, which the export now captures in full. See
+[enhancement-file-to-record-links.md](enhancement-file-to-record-links.md).
+
+---
+
 ## Phase 1: Universal Export Script
 
 **New file:** `scripts/export_all.py`
