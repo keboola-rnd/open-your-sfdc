@@ -73,11 +73,14 @@ def download_content_versions(
     """Download ContentVersion files (Lightning file system)."""
     print("\n=== ContentVersion (Lightning Files) ===")
 
-    # Query all latest versions.
+    # Query all latest versions. FirstPublishLocationId is the record a file was
+    # first published to (Order/Opportunity/Account/…) — a free partial
+    # file->record link that does not depend on ContentDocumentLink visibility.
+    # See docs/enhancement-file-to-record-links.md §R3.
     soql = (
         "SELECT Id, ContentDocumentId, Title, FileExtension, ContentSize, "
         "PathOnClient, VersionNumber, CreatedDate, CreatedById, "
-        "Description, IsLatest "
+        "Description, IsLatest, FirstPublishLocationId "
         "FROM ContentVersion WHERE IsLatest = true"
     )
     results = sf.query_all(soql)
@@ -130,6 +133,7 @@ def download_content_versions(
                 "size": size,
                 "path": str(filepath.relative_to(FILES_DIR)),
                 "created_date": rec.get("CreatedDate"),
+                "first_publish_location_id": rec.get("FirstPublishLocationId"),
             }
 
             if (i + 1) % 10 == 0:
@@ -604,6 +608,215 @@ def download_documents(
     return stats
 
 
+# Salesforce key-prefix -> object type, used to type a linked record id. Only
+# the prefixes relevant to file->record links are mapped; anything else reports
+# as "Unknown" so a consumer can extend this table. Custom objects share the
+# dynamic prefix space and can't be named from the prefix alone.
+SF_PREFIX_TO_TYPE: dict[str, str] = {
+    "001": "Account",
+    "003": "Contact",
+    "005": "User",
+    "006": "Opportunity",
+    "00D": "Organization",
+    "500": "Case",
+    "701": "Campaign",
+    "800": "Contract",
+    "801": "Order",
+}
+
+# When a ContentDocument is shared with several records, prefer the most
+# business-meaningful link. Types not listed (custom objects, Unknown) rank
+# between these and the de-prioritised User/Organization shares.
+_LINK_TYPE_PRIORITY = ["Order", "Contract", "Opportunity", "Account", "Case", "Campaign", "Contact"]
+
+
+def _entity_type(entity_id: str | None) -> str | None:
+    """Map a Salesforce id to its object type via key prefix (best effort)."""
+    if not entity_id or len(entity_id) < 3:
+        return None
+    return SF_PREFIX_TO_TYPE.get(entity_id[:3], "Unknown")
+
+
+def _pick_primary_link(entity_ids: list[str]) -> str | None:
+    """Choose the most business-meaningful link from a file's CDL entries.
+
+    Business records (Order, Contract, Opportunity, …) win over custom/unknown
+    objects, which in turn win over the User/Organization shares that every
+    file carries. Ties break on the id itself for determinism.
+    """
+    if not entity_ids:
+        return None
+
+    def rank(eid: str) -> tuple[int, int, str]:
+        etype = _entity_type(eid)
+        if etype in _LINK_TYPE_PRIORITY:
+            return (0, _LINK_TYPE_PRIORITY.index(etype), eid)
+        if etype in ("User", "Organization"):
+            return (2, 0, eid)
+        return (1, 0, eid)  # custom / unknown business object
+
+    return sorted(entity_ids, key=rank)[0]
+
+
+def enrich_manifest_with_record_links(
+    manifest: dict, *, db_path: Path | None = None
+) -> dict[str, Any]:
+    """Populate a typed linked_entity_id/type on every file entry and
+    de-overload content_document_id.
+
+    Precedence per ContentVersion file (manifest key = ContentVersion Id):
+      1. ContentDocumentLink (full after the export-side R1/R2 fix) — the only
+         source that recovers the signed-PDF -> Order link DocuSign writes back
+         as a normal ContentVersion.
+      2. FirstPublishLocationId (R3) — partial, visibility-independent fallback.
+      3. DocuSign / SDoc parent_id already stashed on the entry — source
+         documents that have no ContentDocumentLink row.
+
+    content_document_id is rewritten to the real 069 id (from the DB, or an
+    existing 069-looking value) or null — it no longer carries an overloaded
+    parent/envelope id. Classic Attachments are linked via their direct ParentId.
+
+    Reads the local SQLite DB read-only; if it (or a needed table) is absent the
+    function logs and returns without touching link fields, so a standalone
+    ``download_files.py`` run that skipped the import step degrades gracefully.
+    See docs/enhancement-file-to-record-links.md §R4.
+    """
+    print("\n=== Enrich manifest with record links ===")
+    import sqlite3
+
+    stats = {
+        "content_document_link": 0,
+        "first_publish_location": 0,
+        "parent": 0,
+        "attachment_parent": 0,
+        "unlinked": 0,
+    }
+
+    if db_path is None:
+        db_path = DATA_DIR / "salesforce_full.db"
+    if not db_path.exists():
+        print(f"  (DB not found at {db_path} — skipping link enrichment)")
+        return stats
+
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+
+    cv_to_cd: dict[str, str] = {}
+    cv_to_fpl: dict[str, str] = {}
+    cd_to_links: dict[str, list[str]] = {}
+    try:
+        # Probe the schema first. A DB imported before R3 added
+        # FirstPublishLocationId to the CV export won't have that column — and
+        # SQLite would silently read a double-quoted missing column as a string
+        # literal, then raise IndexError on row access. So we select only the
+        # columns that actually exist. A missing ContentVersion table yields an
+        # empty PRAGMA, leaving the maps empty (graceful no-op). Selecting only
+        # present columns also keeps cv_to_cd populated when FPL is absent, so
+        # the content_document_id de-overload still resolves real 069 ids.
+        cv_cols = {row[1] for row in conn.execute('PRAGMA table_info("ContentVersion")')}
+        if cv_cols:
+            has_fpl = "FirstPublishLocationId" in cv_cols
+            select_cols = '"Id", "ContentDocumentId"' + (
+                ', "FirstPublishLocationId"' if has_fpl else ""
+            )
+            for r in conn.execute(f"SELECT {select_cols} FROM ContentVersion"):
+                if r["ContentDocumentId"]:
+                    cv_to_cd[r["Id"]] = r["ContentDocumentId"]
+                if has_fpl and r["FirstPublishLocationId"]:
+                    cv_to_fpl[r["Id"]] = r["FirstPublishLocationId"]
+    except sqlite3.OperationalError as exc:
+        print(f"  (ContentVersion not queryable: {exc})")
+    try:
+        for r in conn.execute(
+            'SELECT "ContentDocumentId", "LinkedEntityId" FROM ContentDocumentLink '
+            "WHERE \"LinkedEntityId\" IS NOT NULL AND \"LinkedEntityId\" != ''"
+        ):
+            cd_to_links.setdefault(r["ContentDocumentId"], []).append(r["LinkedEntityId"])
+    except sqlite3.OperationalError as exc:
+        print(f"  (ContentDocumentLink not queryable: {exc})")
+    conn.close()
+
+    print(
+        f"  loaded {len(cv_to_cd):,} CV->CD, {len(cv_to_fpl):,} CV->FPL, "
+        f"{sum(len(v) for v in cd_to_links.values()):,} links over {len(cd_to_links):,} docs"
+    )
+
+    for key, entry in manifest.items():
+        if key.startswith("__") or not isinstance(entry, dict):
+            continue
+        etype = entry.get("type")
+
+        if etype == "Attachment":
+            # Classic attachments carry a direct ParentId — already a record link.
+            pid = entry.get("parent_id")
+            if pid:
+                entry["linked_entity_id"] = pid
+                entry["linked_entity_type"] = _entity_type(pid)
+                entry["linked_entity_source"] = "attachment_parent"
+                stats["attachment_parent"] += 1
+            else:
+                stats["unlinked"] += 1
+            continue
+
+        if etype != "ContentVersion":
+            continue
+
+        cv_id = key
+        # Real ContentDocument id: DB first, then an existing 069-looking value.
+        real_cd = cv_to_cd.get(cv_id)
+        if not real_cd:
+            existing = entry.get("content_document_id")
+            if isinstance(existing, str) and existing.startswith("069"):
+                real_cd = existing
+
+        cdl_links = cd_to_links.get(real_cd, []) if real_cd else []
+        primary = _pick_primary_link(cdl_links)
+        fpl = entry.get("first_publish_location_id") or cv_to_fpl.get(cv_id)
+        parent = entry.get("parent_id")
+
+        # Precedence is literal per spec §R4: ContentDocumentLink, then
+        # FirstPublishLocationId, then DocuSign/SDoc parent. A file whose only
+        # CDL link is a User/Organization share therefore keeps that share
+        # rather than falling through to FPL — rare, and the signed-PDF -> Order
+        # goal is unaffected (those carry the Order link in the CDL).
+        if primary:
+            entry["linked_entity_id"] = primary
+            entry["linked_entity_type"] = _entity_type(primary)
+            entry["linked_entity_source"] = "content_document_link"
+            if len(set(cdl_links)) > 1:
+                entry["linked_entities"] = sorted(set(cdl_links))
+            stats["content_document_link"] += 1
+        elif fpl:
+            entry["linked_entity_id"] = fpl
+            entry["linked_entity_type"] = _entity_type(fpl)
+            entry["linked_entity_source"] = "first_publish_location"
+            stats["first_publish_location"] += 1
+        elif parent:
+            entry["linked_entity_id"] = parent
+            entry["linked_entity_type"] = entry.get("parent_type") or _entity_type(parent)
+            entry["linked_entity_source"] = (
+                "sdoc_parent" if entry.get("source") == "sdoc" else "docusign_parent"
+            )
+            stats["parent"] += 1
+        else:
+            entry["linked_entity_id"] = None
+            entry["linked_entity_type"] = None
+            entry["linked_entity_source"] = None
+            stats["unlinked"] += 1
+
+        # De-overload: content_document_id is now the real 069 id (or null).
+        entry["content_document_id"] = real_cd
+
+    print(
+        f"  linked: {stats['content_document_link']:,} via ContentDocumentLink, "
+        f"{stats['first_publish_location']:,} via FirstPublishLocation, "
+        f"{stats['parent']:,} via parent, "
+        f"{stats['attachment_parent']:,} attachments; "
+        f"{stats['unlinked']:,} still unlinked"
+    )
+    return stats
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--type", choices=["all", "content", "attachment", "document", "external"],
@@ -657,8 +870,13 @@ def main() -> int:
             sf, session, resume=args.resume, dry_run=args.dry_run, manifest=manifest,
         )
 
-    # Save manifest.
+    # Save manifest. Enrich first: join the downloaded binaries to their records
+    # via the (now complete) ContentDocumentLink in the DB, falling back to
+    # FirstPublishLocationId / parent ids. Requires the import step to have run.
+    # (Not folded into all_stats — the summary loop below assumes download-shaped
+    # stats; enrich logs its own counts.)
     if not args.dry_run:
+        enrich_manifest_with_record_links(manifest)
         with open(MANIFEST_PATH, "w") as f:
             json.dump(manifest, f, indent=2)
         print(f"\nManifest saved: {MANIFEST_PATH}")

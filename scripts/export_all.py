@@ -124,17 +124,50 @@ SOQL_QUERY_CHAR_LIMIT = 18_000
 # ContentFolderMember is special: SF only accepts ``=`` here, not ``IN`` —
 # hence chunk_size=1 (yields one query per parent folder).
 #
-# Alphabetical iteration in discover_objects() guarantees the parent runs
-# first for the default full-export case (ContentDocument < ContentDocumentLink,
-# ContentFolder < ContentFolderItem/Member). For ad-hoc --objects runs the
-# helper falls back to a live ``SELECT Id FROM <parent>`` query.
+# ContentDocument is a different beast: a plain ``SELECT ... FROM
+# ContentDocument`` does *not* error, but the Files query-planner silently
+# scopes it to a ~30-row sample (the same scoping that hits ContentVersion —
+# see MANDATORY_WHERE). We rebuild the full set by chunking over the
+# ContentDocumentId column of the now-complete ContentVersion export. This is
+# what restores ContentDocumentLink — and with it every signed-PDF -> Order
+# link. See docs/enhancement-file-to-record-links.md §R1/R2.
+#
+# Ordering: the natural alphabetical sort would run ContentDocument and
+# ContentDocumentLink *before* ContentVersion, but each is now derived from the
+# previous one's CSV. discover_objects() pins the chain order via
+# FILES_EXPORT_ORDER so each parent CSV exists before its child runs. The
+# ContentFolder pair still sorts correctly on its own. For ad-hoc --objects
+# runs that skip the parent, get_parent_ids() falls back to a live
+# ``SELECT <col> FROM <parent>`` query (MANDATORY_WHERE-aware).
 #
 # Format: child_object -> (parent_object, filter_field, parent_id_column, chunk_size).
 FILTER_REQUIRED_OBJECTS: dict[str, tuple[str, str, str, int]] = {
+    "ContentDocument": ("ContentVersion", "Id", "ContentDocumentId", 200),
     "ContentDocumentLink": ("ContentDocument", "ContentDocumentId", "Id", 200),
     "ContentFolderItem": ("ContentFolder", "ParentContentFolderId", "Id", 200),
     "ContentFolderMember": ("ContentFolder", "ParentContentFolderId", "Id", 1),
 }
+
+# Objects whose *unfiltered* SELECT does not error (unlike FILTER_REQUIRED_OBJECTS)
+# but is silently scoped by the Salesforce Files query-planner to a
+# non-exhaustive sample (~30 rows of ~10k). A selective, index-friendly
+# predicate forces the full indexed path. Without this, ContentVersion exports
+# ~30 of ~10k latest files and the whole ContentDocument/ContentDocumentLink
+# chain truncates with it. See docs/enhancement-file-to-record-links.md §R2.
+#
+# Format: object_name -> SOQL WHERE clause (without the WHERE keyword).
+MANDATORY_WHERE: dict[str, str] = {
+    "ContentVersion": "IsLatest = true",
+}
+
+# The Files chain must export parent-before-child regardless of alphabetical
+# order, because each object is derived from the previous one's CSV (see
+# FILTER_REQUIRED_OBJECTS + MANDATORY_WHERE above).
+FILES_EXPORT_ORDER: tuple[str, ...] = (
+    "ContentVersion",
+    "ContentDocument",
+    "ContentDocumentLink",
+)
 
 # Objects the Bulk API rejects with "InvalidEntity" (typically polymorphic
 # junction tables tying Event/Task to Lead/Contact/User). Force REST
@@ -167,6 +200,38 @@ def is_exportable(obj: dict, *, include_history: bool = False) -> bool:
     return True
 
 
+def _pin_files_chain_order(objects: list[dict]) -> list[dict]:
+    """Reorder so the Files chain exports parent-before-child.
+
+    The default alphabetical sort runs ContentDocument and ContentDocumentLink
+    *before* ContentVersion, but each is derived from the previous one's CSV
+    (ContentVersion --MANDATORY_WHERE--> ContentDocument --FILTER_REQUIRED-->
+    ContentDocumentLink). We lift whichever chain members are present out of
+    the list and re-insert them as one block, in FILES_EXPORT_ORDER, at the
+    slot of the earliest one — leaving every other object's order untouched.
+
+    A run that selects 0 or 1 chain members (e.g. ad-hoc ``--objects
+    ContentDocumentLink``) is left as-is; get_parent_ids() then handles the
+    missing parent via its API fallback.
+    """
+    chain = set(FILES_EXPORT_ORDER)
+    present = [o for o in objects if o["name"] in chain]
+    if len(present) <= 1:
+        return objects
+    order_index = {name: i for i, name in enumerate(FILES_EXPORT_ORDER)}
+    ordered_block = sorted(present, key=lambda o: order_index[o["name"]])
+    result: list[dict] = []
+    inserted = False
+    for o in objects:
+        if o["name"] in chain:
+            if not inserted:
+                result.extend(ordered_block)
+                inserted = True
+            continue
+        result.append(o)
+    return result
+
+
 def discover_objects(sf: Salesforce, *, include_history: bool = False) -> list[dict]:
     """Return the list of sobject describe entries we plan to export."""
     print("\nDiscovering objects via sf.describe()...")
@@ -174,6 +239,7 @@ def discover_objects(sf: Salesforce, *, include_history: bool = False) -> list[d
     sobjects = global_desc["sobjects"]
     exportable = [o for o in sobjects if is_exportable(o, include_history=include_history)]
     exportable.sort(key=lambda o: o["name"])
+    exportable = _pin_files_chain_order(exportable)
     history_note = " (+ __History)" if include_history else ""
     print(
         f"  Found {len(sobjects)} sobjects total, "
@@ -198,8 +264,10 @@ def selectable_fields(desc: dict) -> list[dict]:
 
 def count_records(sf: Salesforce, object_name: str) -> int | None:
     """Return the record count for an object, or None on error."""
+    where = MANDATORY_WHERE.get(object_name)
+    where_clause = f" WHERE {where}" if where else ""
     try:
-        result = sf.query(f"SELECT COUNT() FROM {object_name}")
+        result = sf.query(f"SELECT COUNT() FROM {object_name}{where_clause}")
         return int(result["totalSize"])
     except SalesforceError as exc:
         print(f"  Could not count {object_name}: {exc}")
@@ -238,9 +306,11 @@ def query_all_standard(
     include_deleted: bool,
 ) -> list[dict]:
     """Fetch records using the standard REST query_all endpoint."""
+    where = MANDATORY_WHERE.get(object_name)
+    where_clause = f" WHERE {where}" if where else ""
     chunks = chunk_fields_for_soql(fields, object_name)
     if len(chunks) == 1:
-        soql = f"SELECT {', '.join(chunks[0])} FROM {object_name}"
+        soql = f"SELECT {', '.join(chunks[0])} FROM {object_name}{where_clause}"
         result = sf.query_all(soql, include_deleted=include_deleted)
         return result["records"]
 
@@ -248,7 +318,7 @@ def query_all_standard(
     merged: dict[str, dict] = {}
     for chunk in chunks:
         chunk_fields = chunk if "Id" in chunk else ["Id"] + chunk
-        soql = f"SELECT {', '.join(chunk_fields)} FROM {object_name}"
+        soql = f"SELECT {', '.join(chunk_fields)} FROM {object_name}{where_clause}"
         result = sf.query_all(soql, include_deleted=include_deleted)
         for rec in result["records"]:
             rid = rec.get("Id")
@@ -265,7 +335,9 @@ def query_all_bulk(
 ) -> list[dict]:
     """Fetch records via the Bulk API. Much faster for very large objects."""
     bulk_handle = getattr(sf.bulk, object_name)
-    soql = f"SELECT {', '.join(fields)} FROM {object_name}"
+    where = MANDATORY_WHERE.get(object_name)
+    where_clause = f" WHERE {where}" if where else ""
+    soql = f"SELECT {', '.join(fields)} FROM {object_name}{where_clause}"
     # simple_salesforce returns a list of dicts for bulk query_all.
     return list(bulk_handle.query_all(soql))
 
@@ -279,9 +351,19 @@ def get_parent_ids(
     """Return parent IDs for a chunked child query.
 
     Reads from the local parent CSV when present (the common case during a
-    full export, since alphabetical order means the parent ran first). Falls
-    back to ``SELECT Id FROM <parent_object>`` when the CSV is missing — this
-    matters for ad-hoc ``--objects ContentDocumentLink`` runs.
+    full export, since discover_objects() pins parents before children). Falls
+    back to a live query when the CSV is missing — this matters for ad-hoc
+    ``--objects ContentDocumentLink`` runs that skip the parent. Two fallbacks:
+
+    * If the parent is itself a derived filter-required object (e.g.
+      ContentDocument, which a plain ``SELECT Id FROM ContentDocument`` would
+      scope to ~30 rows just like ContentVersion), rebuild it from ITS parent
+      via the same chunked machinery, so the chain doesn't silently re-truncate
+      (ContentDocumentLink -> ContentDocument -> ContentVersion). Recursion is
+      bounded by the Files chain (max 2 hops).
+    * Otherwise query ``SELECT <col> FROM <parent_object>`` directly, honouring
+      MANDATORY_WHERE so a parent like ContentVersion isn't scoped to a 30-row
+      sample.
     """
     if parent_csv.exists() and parent_csv.stat().st_size > 0:
         ids: list[str] = []
@@ -293,11 +375,28 @@ def get_parent_ids(
                     ids.append(pid)
         return ids
 
+    if parent_object in FILTER_REQUIRED_OBJECTS and parent_id_column == "Id":
+        gp_object, gp_filter, gp_col, gp_chunk = FILTER_REQUIRED_OBJECTS[parent_object]
+        gp_csv = parent_csv.parent / f"{gp_object}.csv"
+        print(
+            f"    parent CSV {parent_csv.name} missing -> rebuilding {parent_object} "
+            f"from {gp_object} (derived object; a plain SELECT would be scoped)"
+        )
+        grandparent_ids = get_parent_ids(sf, gp_object, gp_csv, gp_col)
+        records = query_chunked_by_parent_ids(
+            sf, parent_object, ["Id"], gp_filter, grandparent_ids, gp_chunk
+        )
+        return [rec["Id"] for rec in records if rec.get("Id")]
+
+    where = MANDATORY_WHERE.get(parent_object)
+    where_clause = f" WHERE {where}" if where else ""
     print(
         f"    parent CSV {parent_csv.name} missing -> "
-        f"querying {parent_object}.{parent_id_column} from API"
+        f"querying {parent_object}.{parent_id_column} from API{where_clause}"
     )
-    result = sf.query_all(f"SELECT {parent_id_column} FROM {parent_object}")
+    result = sf.query_all(
+        f"SELECT {parent_id_column} FROM {parent_object}{where_clause}"
+    )
     return [rec[parent_id_column] for rec in result["records"] if rec.get(parent_id_column)]
 
 
